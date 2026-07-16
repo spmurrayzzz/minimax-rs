@@ -44,7 +44,7 @@ struct AppState {
 }
 
 const PREFILL_CHUNK: usize = 512;
-const DEFAULT_MAX_TOKENS: usize = 4096;
+const DEFAULT_MAX_TOKENS: usize = 131_072;
 const MAX_CONTEXT: usize = 196_608;
 
 struct ModelState {

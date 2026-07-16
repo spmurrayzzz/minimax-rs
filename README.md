@@ -4,7 +4,7 @@ Custom inference engine for MiniMax-M2.X models in GGUF format. The engine is wr
 
 ## Notes
 
-- The inference engine is still tailored to a specific multi-GPU hardware configuration, but the model location is configurable.
+- I built this as a completely bespoke solution for running my own specific hardware configuration, it's not meant to be portable.
 - The engine is designed to run on a single machine with multiple GPUs. It does not support distributed inference across multiple machines (yet).
 - Lots of AI slop right now in the vendored Candle/CUDA code, due to the need for sm120-specific patching. I will be cleaning this up over time, it's not clear whether any of it really belongs upstream though.
 
@@ -31,7 +31,7 @@ The tokenizer integration test uses `MINIMAX_MODEL_DIR` and is ignored by defaul
 
 Endpoints: `/health`, `/v1/models`, `/v1/completions`, and `/v1/chat/completions`.
 
-Chat completions support SSE streaming, `reasoning_content`, OpenAI function tools, MiniMax XML tool-call parsing, prior assistant/tool turns, and both `max_tokens` and `max_completion_tokens`. The default output limit is 4096 tokens. Exact-prefix KV reuse accelerates subsequent agent/tool turns and is reported as `usage.prompt_tokens_details.cached_tokens`.
+Chat completions support SSE streaming, `reasoning_content`, OpenAI function tools, MiniMax XML tool-call parsing, prior assistant/tool turns, and both `max_tokens` and `max_completion_tokens`. The default output limit is 131,072 tokens. Exact-prefix KV reuse accelerates subsequent agent/tool turns and is reported as `usage.prompt_tokens_details.cached_tokens`.
 
 The implementation uses 512-token parallel prefill chunks. The repaired WMMA MoE path is enabled for prefill batches of at least 192 tokens; shorter batches use the generic parallel CUDA kernel because it has lower fixed overhead.
 
