@@ -648,13 +648,15 @@ static __device__ void mmvq_core_impl(
     const block_q8_1 *__restrict__ y,
     dst_t *__restrict__ dst,
     const int ncols_x, const int nrows_x,
-    const int stride_col_y, const int stride_col_dst) {
+    const int stride_col_y, const int stride_col_dst,
+    const int block_row_offset = 0) {
 
   constexpr int nwarps = mmvq_nwarps_for(ncols_dst);
   constexpr int rows_per_cuda_block = mmvq_rows_per_cuda_block_for(ncols_dst);
 
   const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
-  const int row0 = rows_per_cuda_block * blockIdx.x;
+  const int row0 = rows_per_cuda_block * ((int)blockIdx.x - block_row_offset);
+  if (row0 >= nrows_x) return;
   const int blocks_per_row_x = ncols_x / qk;
   constexpr int blocks_per_iter = vdr * nwarps * WARP_SIZE / qi;
 
@@ -805,6 +807,98 @@ MMVQ_PLAIN_BATCH_SET(q5_k, block_q5_K, QK_K, QI5_K, VDR_Q5_K_Q8_1_MMVQ,
                      vec_dot_q5_K_q8_1)
 MMVQ_PLAIN_BATCH_SET(q6_k, block_q6_K, QK_K, QI6_K, VDR_Q6_K_Q8_1_MMVQ,
                      vec_dot_q6_K_q8_1)
+
+// Single-token Q/K/V projection for MiniMax's Q8_0 attention weights. All
+// three matrices consume the same activation, so quantize it once and launch
+// one grid instead of three independent quantize + matvec pairs.
+extern "C" __global__ void mmvq_gguf_qkv_q8_0_f32_cuda1(
+    const void *__restrict__ vq, const void *__restrict__ vk,
+    const void *__restrict__ vv, const void *__restrict__ vy,
+    float *__restrict__ dst, const int ncols_x, const int q_rows,
+    const int k_rows, const int v_rows, const int stride_col_y) {
+  const int block = (int)blockIdx.x;
+  if (block < q_rows) {
+    mmvq_core_impl<float, QK8_0, QI8_0, block_q8_0,
+                   VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1, 1>(
+        vq, (const block_q8_1 *)vy, dst, ncols_x, q_rows, stride_col_y,
+        q_rows, 0);
+  } else if (block < q_rows + k_rows) {
+    mmvq_core_impl<float, QK8_0, QI8_0, block_q8_0,
+                   VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1, 1>(
+        vk, (const block_q8_1 *)vy, dst + q_rows, ncols_x, k_rows,
+        stride_col_y, k_rows, q_rows);
+  } else {
+    mmvq_core_impl<float, QK8_0, QI8_0, block_q8_0,
+                   VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1, 1>(
+        vv, (const block_q8_1 *)vy, dst + q_rows + k_rows, ncols_x,
+        v_rows, stride_col_y, v_rows, q_rows + k_rows);
+  }
+}
+
+extern "C" __global__ void qkv_rmsnorm_f16_cuda1(
+    const float *__restrict__ src, const float *__restrict__ q_alpha,
+    const float *__restrict__ k_alpha, half *__restrict__ dst,
+    const int q_rows, const int k_rows, const int v_rows, const float eps) {
+  const int projection = (int)blockIdx.x;
+  const int tid = (int)threadIdx.x;
+  const int ncols = projection == 0 ? q_rows : (projection == 1 ? k_rows : v_rows);
+  const int offset = projection == 0 ? 0 : (projection == 1 ? q_rows : q_rows + k_rows);
+
+  if (projection == 2) {
+    for (int col = tid; col < ncols; col += (int)blockDim.x) {
+      dst[offset + col] = (half)src[offset + col];
+    }
+    return;
+  }
+
+  float sum = 0.0f;
+  for (int col = tid; col < ncols; col += (int)blockDim.x) {
+    const float value = src[offset + col];
+    sum += value * value;
+  }
+  sum = warp_reduce_sum_f32(sum);
+  __shared__ float warp_sums[32];
+  const int warp = tid / WARP_SIZE;
+  const int lane = tid % WARP_SIZE;
+  if (lane == 0) warp_sums[warp] = sum;
+  __syncthreads();
+  sum = warp_sums[lane];
+  sum = warp_reduce_sum_f32(sum);
+  const float scale = rsqrtf(sum / (float)ncols + eps);
+  const float *alpha = projection == 0 ? q_alpha : k_alpha;
+  for (int col = tid; col < ncols; col += (int)blockDim.x) {
+    dst[offset + col] = (half)(scale * src[offset + col] * alpha[col]);
+  }
+}
+
+extern "C" __global__ void partial_rope_f16_cuda1(
+    const half *__restrict__ q, const half *__restrict__ k,
+    const float *__restrict__ cos, const float *__restrict__ sin,
+    half *__restrict__ dst, const int q_rows, const int k_rows,
+    const int head_dim, const int rope_dim, const int position) {
+  const int index = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  const int total = q_rows + k_rows;
+  if (index >= total) return;
+  const bool is_q = index < q_rows;
+  const int local = is_q ? index : index - q_rows;
+  const half *src = is_q ? q : k;
+  const int head_col = local % head_dim;
+  if (head_col >= rope_dim) {
+    dst[index] = src[local];
+    return;
+  }
+
+  const int half_rope = rope_dim / 2;
+  const int pair = head_col < half_rope ? local + half_rope : local - half_rope;
+  const int freq = head_col < half_rope ? head_col : head_col - half_rope;
+  const half c = __float2half_rn(cos[position * half_rope + freq]);
+  const half s = __float2half_rn(sin[position * half_rope + freq]);
+  if (head_col < half_rope) {
+    dst[index] = __hsub(__hmul(src[local], c), __hmul(src[pair], s));
+  } else {
+    dst[index] = __hadd(__hmul(src[pair], s), __hmul(src[local], c));
+  }
+}
 
 // Padding-aware BF16/F16/F32 -> Q8_1 quantize kernels.
 
@@ -1046,4 +1140,46 @@ extern "C" void launch_mmvq_gguf_quantize_q8_1_f32(const void *x, void *vy,
   cudaStream_t s = static_cast<cudaStream_t>(stream);
   mmvq_gguf_quantize_q8_1_f32<<<grid, block, 0, s>>>(
       (const float *)x, vy, kx, kx_padded);
+}
+
+extern "C" void launch_mmvq_gguf_qkv_q8_0_f32(
+    const void *x, void *vy, const void *vq, const void *vk, const void *vv,
+    void *dst, int kx, int kx_padded, int q_rows, int k_rows, int v_rows,
+    void *stream) {
+  const int num_blocks_x =
+      (kx_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  mmvq_gguf_quantize_q8_1_f32<<<dim3(num_blocks_x, 1, 1),
+                                dim3(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1), 0, s>>>(
+      (const float *)x, vy, kx, kx_padded);
+  mmvq_gguf_qkv_q8_0_f32_cuda1<<<dim3(q_rows + k_rows + v_rows, 1, 1),
+                                  dim3(WARP_SIZE, 4, 1), 0, s>>>(
+      vq, vk, vv, vy, (float *)dst, kx, q_rows, k_rows, v_rows,
+      kx_padded / QK8_1);
+}
+
+extern "C" void launch_mmvq_gguf_qkv_q8_0_f32_rmsnorm_f16(
+    const void *x, void *vy, const void *vq, const void *vk, const void *vv,
+    void *projection_dst, const void *q_alpha, const void *k_alpha, void *dst,
+    int kx, int kx_padded, int q_rows, int k_rows, int v_rows, float eps,
+    void *stream) {
+  launch_mmvq_gguf_qkv_q8_0_f32(x, vy, vq, vk, vv, projection_dst, kx,
+                                 kx_padded, q_rows, k_rows, v_rows, stream);
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  qkv_rmsnorm_f16_cuda1<<<dim3(3, 1, 1), dim3(1024, 1, 1), 0, s>>>(
+      (const float *)projection_dst, (const float *)q_alpha,
+      (const float *)k_alpha, (half *)dst, q_rows, k_rows, v_rows, eps);
+}
+
+extern "C" void launch_partial_rope_f16(
+    const void *q, const void *k, const void *cos, const void *sin, void *dst,
+    int q_rows, int k_rows, int head_dim, int rope_dim, int position,
+    void *stream) {
+  const int total = q_rows + k_rows;
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  partial_rope_f16_cuda1<<<dim3((total + 255) / 256, 1, 1),
+                                dim3(256, 1, 1), 0, s>>>(
+      (const half *)q, (const half *)k, (const float *)cos,
+      (const float *)sin, (half *)dst, q_rows, k_rows, head_dim, rope_dim,
+      position);
 }

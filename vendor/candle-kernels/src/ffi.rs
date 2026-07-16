@@ -417,6 +417,51 @@ extern "C" {
         num_rows: i32,
         stream: *mut c_void,
     );
+    pub fn launch_mmvq_gguf_qkv_q8_0_f32(
+        x: *const c_void,
+        vy: *mut c_void,
+        vq: *const c_void,
+        vk: *const c_void,
+        vv: *const c_void,
+        dst: *mut c_void,
+        kx: i32,
+        kx_padded: i32,
+        q_rows: i32,
+        k_rows: i32,
+        v_rows: i32,
+        stream: *mut c_void,
+    );
+    pub fn launch_mmvq_gguf_qkv_q8_0_f32_rmsnorm_f16(
+        x: *const c_void,
+        vy: *mut c_void,
+        vq: *const c_void,
+        vk: *const c_void,
+        vv: *const c_void,
+        projection_dst: *mut c_void,
+        q_alpha: *const c_void,
+        k_alpha: *const c_void,
+        dst: *mut c_void,
+        kx: i32,
+        kx_padded: i32,
+        q_rows: i32,
+        k_rows: i32,
+        v_rows: i32,
+        eps: f32,
+        stream: *mut c_void,
+    );
+    pub fn launch_partial_rope_f16(
+        q: *const c_void,
+        k: *const c_void,
+        cos: *const c_void,
+        sin: *const c_void,
+        dst: *mut c_void,
+        q_rows: i32,
+        k_rows: i32,
+        head_dim: i32,
+        rope_dim: i32,
+        position: i32,
+        stream: *mut c_void,
+    );
 
     // ============== Dense GGUF MMQ launchers (from mmq_gguf/) ==============
 

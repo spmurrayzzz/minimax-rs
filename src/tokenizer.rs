@@ -19,6 +19,13 @@ use tokenizers::{
 // by llama.cpp and the original tokenizer.json.
 const MINIMAX_PRETOKENIZER_REGEX: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+#[derive(Default)]
+pub struct DecodeState {
+    ids: Vec<u32>,
+    prefix: String,
+    prefix_index: usize,
+}
+
 pub struct MiniMaxTokenizer {
     inner: Tokenizer,
     pub eos: u32,
@@ -128,6 +135,18 @@ impl MiniMaxTokenizer {
             .inner
             .decode(ids, true)
             .map_err(|e| anyhow::anyhow!("decode failed: {e}"))?)
+    }
+
+    pub fn decode_step(&self, state: &mut DecodeState, id: u32) -> Result<Option<String>> {
+        tokenizers::tokenizer::step_decode_stream(
+            &self.inner,
+            id,
+            true,
+            &mut state.ids,
+            &mut state.prefix,
+            &mut state.prefix_index,
+        )
+        .map_err(|e| anyhow::anyhow!("stream decode failed: {e}"))
     }
 }
 

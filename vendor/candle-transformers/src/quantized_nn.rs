@@ -112,9 +112,17 @@ impl RmsNorm {
     }
 
     pub fn from_qtensor(weight: QTensor, eps: f64) -> Result<Self> {
-        let span = tracing::span!(tracing::Level::TRACE, "rms-norm");
         let weight = weight.dequantize(&weight.device())?;
-        Ok(Self { weight, eps, span })
+        Ok(Self::from_weights(weight, eps))
+    }
+
+    pub fn from_weights(weight: Tensor, eps: f64) -> Self {
+        let span = tracing::span!(tracing::Level::TRACE, "rms-norm");
+        Self { weight, eps, span }
+    }
+
+    pub fn weight(&self) -> &Tensor {
+        &self.weight
     }
 }
 

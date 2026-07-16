@@ -1281,12 +1281,11 @@ __device__ __forceinline__ float convert_from_half<float>(half val) {
 }
 
 template<typename dst_t>
-inline __device__ void dequantize_block_q2_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+inline __device__ void dequantize_block_q2_K(const void * __restrict__ vx, dst_t * __restrict__ yy, int tid) {
 
     const auto i   = 0; //we only need dequant one block in each call
     const block_q2_K * x = (const block_q2_K *) vx;
 
-    const auto tid = threadIdx.x;
     const int n   = tid/32;
     const int l   = tid - 32*n;
     const int is  = 8*n + l/16;
@@ -1303,15 +1302,15 @@ inline __device__ void dequantize_block_q2_K(const void * __restrict__ vx, dst_t
 }
 
 template<typename dst_t>
-inline __device__ void dequantize_block_q3_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+inline __device__ void dequantize_block_q3_K(const void * __restrict__ vx, dst_t * __restrict__ yy, int logical_tid) {
 
     const auto i = 0;
     const block_q3_K * x = (const block_q3_K *) vx;
 
-    const auto r = threadIdx.x/4;
+    const auto r = logical_tid/4;
     const int tid = r/2;
     const int is0 = r%2;
-    const int l0 = 16*is0 + 4*(threadIdx.x%4);
+    const int l0 = 16*is0 + 4*(logical_tid%4);
     const int n = tid / 4;
     const int j = tid - 4*n;
 
@@ -1345,13 +1344,12 @@ static inline __device__ void get_scale_min_k4(int j, const uint8_t * q, uint8_t
 }
 
 template<typename dst_t>
-inline __device__ void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+inline __device__ void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restrict__ yy, int tid) {
     const block_q4_K * x = (const block_q4_K *) vx;
 
     const auto i = 0;
 
-    // assume 32 threads
-    const auto tid = threadIdx.x;
+    // One logical thread per lane (32 total).
     const int il  = tid/8;
     const int ir  = tid%8;
     const int is  = 2*il;
@@ -1378,13 +1376,12 @@ inline __device__ void dequantize_block_q4_K(const void * __restrict__ vx, dst_t
 }
 
 template<typename dst_t>
-inline __device__ void dequantize_block_q5_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+inline __device__ void dequantize_block_q5_K(const void * __restrict__ vx, dst_t * __restrict__ yy, int tid) {
     const block_q5_K * x = (const block_q5_K *) vx;
 
     const auto i = 0;
 
-    // assume 64 threads - this is very slightly better than the one below
-    const auto tid = threadIdx.x;
+    // 64 logical threads; a 32-lane warp invokes this twice per lane.
     const int il  = tid/16;   // il is in 0...3
     const int ir  = tid%16;   // ir is in 0...15
     const int is  = 2*il;     // is is in 0...6
@@ -1412,13 +1409,12 @@ inline __device__ void dequantize_block_q5_K(const void * __restrict__ vx, dst_t
 }
 
 template<typename dst_t>
-inline __device__ void dequantize_block_q6_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+inline __device__ void dequantize_block_q6_K(const void * __restrict__ vx, dst_t * __restrict__ yy, int tid) {
     const block_q6_K * x = (const block_q6_K *) vx;
 
     const auto i = 0;
 
-    // assume 64 threads - this is very slightly better than the one below
-    const auto tid = threadIdx.x;
+    // 64 logical threads; a 32-lane warp invokes this twice per lane.
     const int ip  = tid/32;   // ip is 0 or 1
     const int il  = tid - 32*ip; // 0...32
     const int is  = 8*ip + il/16;

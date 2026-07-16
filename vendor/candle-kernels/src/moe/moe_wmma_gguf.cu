@@ -75,24 +75,28 @@ __forceinline__ __device__ void dequantize_block_warp(
             }
             break;
         }
-        case 1: { // q4k, 32 lanes
-            dequantize_block_q4_K<T>(quant_in, dequant_out);
+        case 1: { // q4k, 32 logical lanes
+            dequantize_block_q4_K<T>(quant_in, dequant_out, threadIdx.x);
             break;
         }
-        case 2: { // q2k, 64 lanes
-            dequantize_block_q2_K<T>(quant_in, dequant_out);
+        case 2: { // q2k, 64 logical lanes
+            dequantize_block_q2_K<T>(quant_in, dequant_out, threadIdx.x);
+            dequantize_block_q2_K<T>(quant_in, dequant_out, threadIdx.x + 32);
             break;
         }
-        case 3: { // q3k, 64 lanes
-            dequantize_block_q3_K<T>(quant_in, dequant_out);
+        case 3: { // q3k, 64 logical lanes
+            dequantize_block_q3_K<T>(quant_in, dequant_out, threadIdx.x);
+            dequantize_block_q3_K<T>(quant_in, dequant_out, threadIdx.x + 32);
             break;
         }
-        case 4: { // q5k, 64 lanes
-            dequantize_block_q5_K<T>(quant_in, dequant_out);
+        case 4: { // q5k, 64 logical lanes
+            dequantize_block_q5_K<T>(quant_in, dequant_out, threadIdx.x);
+            dequantize_block_q5_K<T>(quant_in, dequant_out, threadIdx.x + 32);
             break;
         }
-        case 5: { // q6k, 64 lanes
-            dequantize_block_q6_K<T>(quant_in, dequant_out);
+        case 5: { // q6k, 64 logical lanes
+            dequantize_block_q6_K<T>(quant_in, dequant_out, threadIdx.x);
+            dequantize_block_q6_K<T>(quant_in, dequant_out, threadIdx.x + 32);
             break;
         }
         default:
@@ -219,21 +223,20 @@ __global__ void moe_gemm_gguf_prefill_kernel(
                 }
             }
 
-            // Load B Tile (Quantized) into B_quant_sh
+            // Load B Tile (Quantized) into B_quant_sh. Assign each row to
+            // exactly one thread; the previous all-lanes struct assignment
+            // raced 32 copies into the same shared-memory destination.
             const size_t k_base_offset_bytes = (k_base / qk) * block_size_bytes;
             constexpr int ROWS_PER_WARP = N_BLK / WARPS_PER_BLOCK;
-            
-            #pragma unroll
-            for (int row = 0; row < ROWS_PER_WARP; ++row) {
-                int n_local = warpId * ROWS_PER_WARP + row;
+            for (int n_local = threadId; n_local < N_BLK; n_local += BLOCK_THREADS) {
                 int n_global = n_base + n_local;
-                if (n_local < N_BLK && n_global < size_n) {
+                if (n_global < size_n) {
                     block_q_t* dest_ptr = reinterpret_cast<block_q_t*>(B_quant_sh + n_local * block_size_bytes);
                     const block_q_t* src_ptr = reinterpret_cast<const block_q_t*>(expert_w + (size_t)n_global * expert_w_row_stride_bytes + k_base_offset_bytes);
                     *dest_ptr = *src_ptr;
                 }
             }
-            
+
             __syncthreads();
 
             // Dequantize B from B_quant_sh to B_sh
@@ -268,6 +271,11 @@ __global__ void moe_gemm_gguf_prefill_kernel(
                 
                 mma_sync(c_frag, a_frag, b_frag, c_frag);
             }
+
+            // A_sh/B_sh are reused by the next K tile. Keep faster warps
+            // from overwriting them while another warp is still loading its
+            // final WMMA fragments.
+            __syncthreads();
         } // end k_base loop
 
         // Store C_frag to C_sh
@@ -296,6 +304,10 @@ __global__ void moe_gemm_gguf_prefill_kernel(
                 }
             }
         }
+
+        // C_sh is reused for the next row tile; all threads must finish the
+        // cooperative global store before any warp overwrites it.
+        __syncthreads();
     } // end m_base loop
 }
 
@@ -317,32 +329,32 @@ __global__ void moe_gemm_gguf_prefill_kernel(
             output, num_experts, topk, size_m, size_n, size_k, gguf_type\
         );\
     } else if (gguf_type == 2) {\
-        dim3 block(64, WARPS_PER_BLOCK, 1);\
-        moe_gemm_gguf_prefill_kernel<DTYPE, QK_K, block_q2_K, 64><<<grid, block, smem_bytes, stream>>>(\
+        dim3 block(32, WARPS_PER_BLOCK, 1);\
+        moe_gemm_gguf_prefill_kernel<DTYPE, QK_K, block_q2_K, 32><<<grid, block, smem_bytes, stream>>>(\
             reinterpret_cast<const DTYPE*>(input),\
             reinterpret_cast<const uint8_t*>(weights),\
             sorted_token_ids, expert_offsets, topk_weights,\
             output, num_experts, topk, size_m, size_n, size_k, gguf_type\
         );\
     } else if (gguf_type == 3) {\
-        dim3 block(64, WARPS_PER_BLOCK, 1);\
-        moe_gemm_gguf_prefill_kernel<DTYPE, QK_K, block_q3_K, 64><<<grid, block, smem_bytes, stream>>>(\
+        dim3 block(32, WARPS_PER_BLOCK, 1);\
+        moe_gemm_gguf_prefill_kernel<DTYPE, QK_K, block_q3_K, 32><<<grid, block, smem_bytes, stream>>>(\
             reinterpret_cast<const DTYPE*>(input),\
             reinterpret_cast<const uint8_t*>(weights),\
             sorted_token_ids, expert_offsets, topk_weights,\
             output, num_experts, topk, size_m, size_n, size_k, gguf_type\
         );\
     } else if (gguf_type == 4) { \
-        dim3 block(64, WARPS_PER_BLOCK, 1);\
-        moe_gemm_gguf_prefill_kernel<DTYPE, QK_K, block_q5_K, 64><<<grid, block, smem_bytes, stream>>>(\
+        dim3 block(32, WARPS_PER_BLOCK, 1);\
+        moe_gemm_gguf_prefill_kernel<DTYPE, QK_K, block_q5_K, 32><<<grid, block, smem_bytes, stream>>>(\
             reinterpret_cast<const DTYPE*>(input),\
             reinterpret_cast<const uint8_t*>(weights),\
             sorted_token_ids, expert_offsets, topk_weights,\
             output, num_experts, topk, size_m, size_n, size_k, gguf_type\
         );\
     } else if (gguf_type == 5) { \
-        dim3 block(64, WARPS_PER_BLOCK, 1);\
-        moe_gemm_gguf_prefill_kernel<DTYPE, QK_K, block_q6_K, 64><<<grid, block, smem_bytes, stream>>>(\
+        dim3 block(32, WARPS_PER_BLOCK, 1);\
+        moe_gemm_gguf_prefill_kernel<DTYPE, QK_K, block_q6_K, 32><<<grid, block, smem_bytes, stream>>>(\
             reinterpret_cast<const DTYPE*>(input),\
             reinterpret_cast<const uint8_t*>(weights),\
             sorted_token_ids, expert_offsets, topk_weights,\

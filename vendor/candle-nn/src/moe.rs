@@ -5,6 +5,16 @@ use candle::cuda_backend::kernels::ffi;
 use candle::quantized::{self, QTensor};
 use candle::{Result, Tensor};
 
+fn wmma_min_tokens() -> usize {
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MINIMAX_WMMA_MIN_TOKENS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(192)
+    })
+}
+
 #[cfg(feature = "cuda")]
 pub fn moe_gemm(
     input: &Tensor,
@@ -192,7 +202,13 @@ pub fn moe_gemm_gguf(
         _is_prefill: bool,
         dtype: DType,
     ) -> Result<Tensor> {
-        let (mut size_m, size_k) = input.dims2()?;
+        let (input_rows, size_k) = input.dims2()?;
+        let num_tokens = if topk_weights.is_none() {
+            input_rows
+        } else {
+            input_rows / topk
+        };
+        let mut size_m = input_rows;
         if topk_weights.is_none() {
             size_m *= topk;
         }
@@ -251,12 +267,10 @@ pub fn moe_gemm_gguf(
         use core::ffi::c_void;
 
         assert!(size_k % 8 == 0, "size_k must divisible by 8");
-        // The custom WMMA kernel races when a batch spans multiple expert
-        // segments (and its 64-lane Q5_K/Q6_K path races even for one expert).
-        // The quantized dot-product kernel below is also batched/parallel and
-        // matches the dequantized reference, so use it for correctness until
-        // the segmented WMMA implementation is replaced.
-        let use_wmma_prefill = false;
+        // The tensor-core kernel amortizes weight dequantization only on larger
+        // routed batches. It crosses over near 160 tokens on sm_120; keep a
+        // conservative threshold so short prompts do not regress TTFT.
+        let use_wmma_prefill = _is_prefill && num_tokens >= wmma_min_tokens();
         unsafe {
             if use_wmma_prefill {
                 let input = input.to_dtype(dtype)?;

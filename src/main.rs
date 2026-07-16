@@ -11,7 +11,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use candle_core::{Device, quantized::gguf_file};
+use candle_core::{D, Device, Tensor, quantized::gguf_file};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -51,7 +51,7 @@ struct ModelState {
     /// KV cache contents. A later agent/tool turn commonly extends this exact
     /// token prefix, so retain it instead of re-prefilling the whole session.
     cached_ids: Vec<u32>,
-    next_logits: Vec<f32>,
+    next_logits: Option<Tensor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,12 +115,18 @@ impl Engine {
         let devices = (0..2)
             .map(Device::new_cuda)
             .collect::<candle_core::Result<Vec<_>>>()?;
+        // Inference uses exactly one CUDA stream per GPU and synchronizes the
+        // host-staged device boundary explicitly. Avoid cudarc's per-allocation
+        // cross-stream events, which otherwise dominate single-token decode.
+        for device in &devices {
+            unsafe { device.as_cuda_device()?.disable_event_tracking() };
+        }
         let tokenizer = tokenizer::MiniMaxTokenizer::from_gguf(&shards[0])?;
         let loaded = if load_model {
             Some(ModelState {
                 model: model::Model::load(&shards, &devices)?,
                 cached_ids: Vec::new(),
-                next_logits: Vec::new(),
+                next_logits: None,
             })
         } else {
             None
@@ -175,12 +181,12 @@ impl Engine {
         let reusable = !state.cached_ids.is_empty()
             && prompt.len() >= state.cached_ids.len()
             && prompt.starts_with(&state.cached_ids)
-            && !state.next_logits.is_empty();
+            && state.next_logits.is_some();
         let cached_prompt_tokens = if reusable { state.cached_ids.len() } else { 0 };
         if !reusable {
             state.model.reset();
             state.cached_ids.clear();
-            state.next_logits.clear();
+            state.next_logits = None;
         }
         debug!(
             prompt_tokens = prompt.len(),
@@ -190,45 +196,40 @@ impl Engine {
         let mut next = state.next_logits.clone();
         for chunk in prompt[state.cached_ids.len()..].chunks(PREFILL_CHUNK) {
             let offset = state.cached_ids.len();
-            next = state.model.forward(chunk, offset)?.to_vec1::<f32>()?;
+            next = Some(state.model.forward(chunk, offset)?);
             state.cached_ids.extend_from_slice(chunk);
         }
-        if next.is_empty() {
-            bail!("no logits available for prompt")
-        }
-        state.next_logits = next.clone();
+        let mut next = next.context("no logits available for prompt")?;
+        state.next_logits = Some(next.clone());
 
         let mut generated = Vec::new();
-        let mut emitted = String::new();
+        let mut decode_state = tokenizer::DecodeState::default();
         let mut finish = GenerationFinish::Length;
         for _ in 0..max_tokens {
-            let (id, _) = next
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1))
-                .context("empty logits")?;
-            let id = id as u32;
+            // Reduce the 200k vocabulary on-device; copying every logit over
+            // PCIe and scanning it on the CPU costs roughly 0.35 ms/token.
+            let id = next.argmax(D::Minus1)?.to_scalar::<u32>()?;
             if id == self.tokenizer.eos {
                 finish = GenerationFinish::Eos;
                 break;
             }
             generated.push(id);
 
-            // Decode cumulatively so byte-level tokens split across a Unicode
-            // scalar are not independently turned into replacement characters.
-            let decoded = self.tokenizer.decode(&generated)?;
-            let stable = decoded.trim_end_matches('\u{fffd}');
-            let delta = stable.strip_prefix(&emitted).unwrap_or_default().to_owned();
-            emitted = stable.to_owned();
+            // DecodeStream retains only the short byte/prefix window needed
+            // for UTF-8 boundaries instead of decoding the full history.
+            let delta = self
+                .tokenizer
+                .decode_step(&mut decode_state, id)?
+                .unwrap_or_default();
             if !on_token(id, delta) {
                 finish = GenerationFinish::Cancelled;
                 break;
             }
 
             let offset = state.cached_ids.len();
-            next = state.model.forward(&[id], offset)?.to_vec1::<f32>()?;
+            next = state.model.forward(&[id], offset)?;
             state.cached_ids.push(id);
-            state.next_logits = next.clone();
+            state.next_logits = Some(next.clone());
         }
 
         Ok(GenerationResult {

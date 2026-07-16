@@ -149,6 +149,10 @@ impl RotaryEmbedding {
         let end = start + self.half_d;
         (&self.cos_f32[start..end], &self.sin_f32[start..end])
     }
+
+    pub fn cos_sin_tensors(&self) -> (&Tensor, &Tensor) {
+        (&self.cos, &self.sin)
+    }
 }
 
 #[derive(Debug, Clone)]

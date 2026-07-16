@@ -2,15 +2,17 @@
 //! pre-norm GQA, independently-normalised Q/K, partial (64 dimension) RoPE, and
 //! sigmoid-gated top-8-of-256 SwiGLU experts.
 use anyhow::Result;
-use candle_core::{DType, Device, Module, Tensor};
+use candle_core::{
+    DType, Device, Module, Tensor,
+    quantized::{GgmlDType, QTensor},
+};
 use candle_nn::Embedding;
-use candle_nn::kv_cache::ConcatKvCache;
+use candle_nn::kv_cache::KvCache;
 use candle_transformers::{
     fused_moe::{FusedMoeGGUF, MoeCfg},
     models::{quantized_qwen3::RotaryEmbedding, with_tracing::QMatMul},
     quantized_nn::RmsNorm,
     quantized_var_builder::VarBuilder,
-    utils::repeat_kv,
 };
 use std::sync::Arc;
 
@@ -28,23 +30,37 @@ struct Attention {
     q: QMatMul,
     k: QMatMul,
     v: QMatMul,
+    qw: Arc<QTensor>,
+    kw: Arc<QTensor>,
+    vw: Arc<QTensor>,
     o: QMatMul,
     qn: RmsNorm,
     kn: RmsNorm,
     rope: Arc<RotaryEmbedding>,
-    cache: ConcatKvCache,
+    cache: KvCache,
+    fused_decode: bool,
 }
 impl Attention {
     fn new(v: &VarBuilder, rope: Arc<RotaryEmbedding>) -> candle_core::Result<Self> {
+        let qw = v.pp("attn_q").get((QH * HD, H), "weight")?;
+        let kw = v.pp("attn_k").get((KVH * HD, H), "weight")?;
+        let vw = v.pp("attn_v").get((KVH * HD, H), "weight")?;
+        let fused_decode = [qw.dtype(), kw.dtype(), vw.dtype()]
+            .iter()
+            .all(|dtype| *dtype == GgmlDType::Q8_0);
         Ok(Self {
-            q: QMatMul::new(H, QH * HD, v.pp("attn_q"))?,
-            k: QMatMul::new(H, KVH * HD, v.pp("attn_k"))?,
-            v: QMatMul::new(H, KVH * HD, v.pp("attn_v"))?,
+            q: QMatMul::from_weights(qw.clone())?,
+            k: QMatMul::from_weights(kw.clone())?,
+            v: QMatMul::from_weights(vw.clone())?,
+            qw,
+            kw,
+            vw,
             o: QMatMul::new(QH * HD, H, v.pp("attn_output"))?,
             qn: RmsNorm::new(QH * HD, 1e-6, v.pp("attn_q_norm"))?,
             kn: RmsNorm::new(KVH * HD, 1e-6, v.pp("attn_k_norm"))?,
             rope,
-            cache: ConcatKvCache::new(2),
+            cache: KvCache::new(2, 4096),
+            fused_decode,
         })
     }
     fn reset(&mut self) {
@@ -57,42 +73,77 @@ impl Attention {
         pos: usize,
     ) -> candle_core::Result<Tensor> {
         let (_, l, _) = x.dims3()?;
-        let q = self
-            .qn
-            .forward(&self.q.forward(x)?.contiguous()?)?
-            .reshape((1, l, QH, HD))?
-            .transpose(1, 2)?
-            .contiguous()?
-            .to_dtype(DType::F16)?;
-        let k = self
-            .kn
-            .forward(&self.k.forward(x)?.contiguous()?)?
-            .reshape((1, l, KVH, HD))?
-            .transpose(1, 2)?
-            .contiguous()?
-            .to_dtype(DType::F16)?;
-        let v = self
-            .v
-            .forward(x)?
-            .reshape((1, l, KVH, HD))?
-            .transpose(1, 2)?
-            .contiguous()?
-            .to_dtype(DType::F16)?;
-        // MiniMax uses a 64-dimensional rotary subspace despite 128-dimensional heads.
-        let (qr, kr) = self
-            .rope
-            .apply(&q.narrow(3, 0, ROT)?, &k.narrow(3, 0, ROT)?, pos)?;
-        let q = Tensor::cat(&[qr, q.narrow(3, ROT, HD - ROT)?], 3)?.contiguous()?;
-        let k = Tensor::cat(&[kr, k.narrow(3, ROT, HD - ROT)?], 3)?.contiguous()?;
+        let (q, k, v) = if l == 1 && self.fused_decode {
+            // Decode projects Q/K/V from the same activation. Sharing its Q8_1
+            // quantization and fusing Q/K RMSNorm plus F16 conversion removes
+            // eight tiny launches per layer.
+            let (q, k, v) = candle_nn::fused_qkv::q8_0_decode_rmsnorm_f16(
+                x,
+                &self.qw,
+                &self.kw,
+                &self.vw,
+                self.qn.weight(),
+                self.kn.weight(),
+                1e-6,
+            )?;
+            // MiniMax rotates only the first 64 dimensions of each 128-d head.
+            // Keep the F32 tables resident and fuse both Q/K rotations with the
+            // partial-dimension copy instead of casting/catting per layer.
+            let (cos, sin) = self.rope.cos_sin_tensors();
+            let (q, k) = candle_nn::fused_qkv::partial_rope_f16(&q, &k, cos, sin, pos, HD, ROT)?;
+            (
+                q.reshape((1, l, QH, HD))?.transpose(1, 2)?.contiguous()?,
+                k.reshape((1, l, KVH, HD))?.transpose(1, 2)?.contiguous()?,
+                v.reshape((1, l, KVH, HD))?.transpose(1, 2)?.contiguous()?,
+            )
+        } else {
+            let q = self
+                .qn
+                .forward(&self.q.forward(x)?.contiguous()?)?
+                .reshape((1, l, QH, HD))?
+                .transpose(1, 2)?
+                .contiguous()?
+                .to_dtype(DType::F16)?;
+            let k = self
+                .kn
+                .forward(&self.k.forward(x)?.contiguous()?)?
+                .reshape((1, l, KVH, HD))?
+                .transpose(1, 2)?
+                .contiguous()?
+                .to_dtype(DType::F16)?;
+            let v = self
+                .v
+                .forward(x)?
+                .reshape((1, l, KVH, HD))?
+                .transpose(1, 2)?
+                .contiguous()?
+                .to_dtype(DType::F16)?;
+            let (qr, kr) = self
+                .rope
+                .apply(&q.narrow(3, 0, ROT)?, &k.narrow(3, 0, ROT)?, pos)?;
+            (
+                Tensor::cat(&[qr, q.narrow(3, ROT, HD - ROT)?], 3)?.contiguous()?,
+                Tensor::cat(&[kr, k.narrow(3, ROT, HD - ROT)?], 3)?.contiguous()?,
+                v,
+            )
+        };
         let (k, v) = self.cache.append(&k, &v)?;
-        let k = repeat_kv(k, QH / KVH)?.contiguous()?;
-        let v = repeat_kv(v, QH / KVH)?.contiguous()?;
-        let mut scores = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)?
-            * (1.0 / (HD as f64).sqrt()))?;
+
+        // Group Q heads by their shared KV head. Flattening repetition and
+        // sequence into GEMM's M dimension performs true GQA without copying K
+        // and V six times; it is also much faster for long-context decode.
+        let kv_len = k.dim(2)?;
+        let q = q.reshape((1, KVH, (QH / KVH) * l, HD))?;
+        let mut scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)?
+            * (1.0 / (HD as f64).sqrt()))?
+        .reshape((1, KVH, QH / KVH, l, kv_len))?;
         if let Some(m) = mask {
             scores = scores.broadcast_add(&m.to_dtype(scores.dtype())?)?;
         }
-        let y = candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?;
+        let y = candle_nn::ops::softmax_last_dim(&scores)?
+            .reshape((1, KVH, (QH / KVH) * l, kv_len))?
+            .matmul(&v)?
+            .reshape((1, QH, l, HD))?;
         self.o
             .forward(&y.transpose(1, 2)?.contiguous()?.reshape((1, l, QH * HD))?)
     }
@@ -251,7 +302,10 @@ impl Model {
             Some(
                 self.devices
                     .iter()
-                    .map(|device| Tensor::from_vec(values.clone(), (1, 1, l, l + pos), device))
+                    .map(|device| {
+                        Tensor::from_vec(values.clone(), (1, 1, l, l + pos), device)?
+                            .to_dtype(DType::F16)
+                    })
                     .collect::<candle_core::Result<Vec<_>>>()?,
             )
         } else {
