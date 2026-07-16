@@ -457,13 +457,16 @@ impl ChatStreamParser {
             return Vec::new();
         }
         if id == self.markers.tool_end {
-            let calls = parse_tool_calls(&self.tool_buffer, &self.valid_names);
+            let buffered = std::mem::take(&mut self.tool_buffer);
+            let calls = parse_tool_calls(&buffered, &self.valid_names);
             self.mode = StreamMode::Content;
-            self.tool_buffer.clear();
-            return (!calls.is_empty())
-                .then_some(StreamDelta::ToolCalls(calls))
-                .into_iter()
-                .collect();
+            return if calls.is_empty() {
+                vec![StreamDelta::Content(format!(
+                    "{TOOL_START}{buffered}{TOOL_END}"
+                ))]
+            } else {
+                vec![StreamDelta::ToolCalls(calls)]
+            };
         }
         if text.is_empty() {
             return Vec::new();
@@ -477,6 +480,18 @@ impl ChatStreamParser {
             }
         }
     }
+
+    /// Flush an unterminated tool block as visible content. This keeps a
+    /// length-limited stream consistent with the non-streaming parser rather
+    /// than silently dropping everything after the opening marker.
+    pub fn finish(&mut self) -> Vec<StreamDelta> {
+        if self.mode != StreamMode::Tool {
+            return Vec::new();
+        }
+        self.mode = StreamMode::Content;
+        let buffered = std::mem::take(&mut self.tool_buffer);
+        vec![StreamDelta::Content(format!("{TOOL_START}{buffered}"))]
+    }
 }
 
 #[cfg(test)]
@@ -484,23 +499,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn renders_tools_and_parses_calls() {
-        let tools = vec![json!({
-            "type": "function",
-            "function": {
-                "name": "read",
-                "description": "Read a file",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"]
-                }
-            }
-        })];
-        let messages = vec![ChatMessage {
-            role: "user".into(),
-            content: Some(json!("Open README.md")),
+    fn message(role: &str, content: Value) -> ChatMessage {
+        ChatMessage {
+            role: role.to_owned(),
+            content: Some(content),
             reasoning_content: None,
             reasoning: None,
             reasoning_text: None,
@@ -508,21 +510,368 @@ mod tests {
             tool_call_id: None,
             current_date: None,
             current_location: None,
-        }];
-        let prompt = render_prompt(&messages, &tools).unwrap();
-        assert!(prompt.contains("# Tools\n"));
-        assert!(prompt.contains("<tool>"));
-        assert!(prompt.ends_with("]~b]ai\n<think>\n"));
+        }
+    }
 
-        let raw = "We need the file.\n</think>\n\n<minimax:tool_call>\n<invoke name=\"read\">\n<parameter name=\"path\">README.md</parameter>\n</invoke>\n</minimax:tool_call>";
-        let parsed = parse_assistant(raw, &tool_names(&tools));
-        assert_eq!(parsed.reasoning.as_deref(), Some("We need the file."));
-        assert_eq!(parsed.content, None);
+    fn text_message(role: &str, content: &str) -> ChatMessage {
+        message(role, json!(content))
+    }
+
+    fn function_tool(name: &str) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }
+            }
+        })
+    }
+
+    fn incoming_call(name: &str, arguments: Value) -> Value {
+        json!({
+            "id": "call_previous",
+            "type": "function",
+            "function": {"name": name, "arguments": arguments}
+        })
+    }
+
+    fn parsed_arguments(call: &AssistantToolCall) -> Value {
+        serde_json::from_str(&call.function.arguments).expect("valid JSON arguments")
+    }
+
+    fn markers() -> MarkerIds {
+        MarkerIds {
+            think_start: 10,
+            think_end: 11,
+            tool_start: 12,
+            tool_end: 13,
+        }
+    }
+
+    #[test]
+    fn visible_text_normalizes_openai_content_parts() {
+        let content = json!([
+            "Hello",
+            {"type": "text", "text": " world"},
+            {"type": "image_url", "image_url": {"url": "ignored"}},
+            {"type": "text", "text": 42},
+            null
+        ]);
+
+        assert_eq!(visible_text(None), "");
+        assert_eq!(visible_text(Some(&Value::Null)), "");
+        assert_eq!(visible_text(Some(&content)), "Hello world");
+        assert_eq!(
+            visible_text(Some(&json!({"key": "value"}))),
+            r#"{"key":"value"}"#
+        );
+    }
+
+    #[test]
+    fn renders_the_native_default_conversation_envelope() {
+        let prompt = render_prompt(&[text_message("user", "Hello")], &[]).expect("render prompt");
+
+        assert_eq!(
+            prompt,
+            concat!(
+                "]~!b[]~b]system\n",
+                "You are a helpful assistant. Your name is MiniMax-M2.7 and is built by MiniMax.",
+                "[e~[\n",
+                "]~b]user\nHello[e~[\n",
+                "]~b]ai\n<think>\n"
+            )
+        );
+    }
+
+    #[test]
+    fn renders_system_metadata_and_multipart_text() {
+        let mut system = message(
+            "system",
+            json!(["Follow ", {"type": "text", "text": "policy."}]),
+        );
+        system.current_date = Some("2026-04-01".to_owned());
+        system.current_location = Some("London".to_owned());
+
+        let prompt =
+            render_prompt(&[system, text_message("user", "Hi")], &[]).expect("render prompt");
+        assert!(prompt.starts_with(
+            "]~!b[]~b]system\nFollow policy.\nCurrent date: 2026-04-01\nCurrent location: London[e~[\n"
+        ));
+        assert!(prompt.contains("]~b]user\nHi[e~[\n"));
+    }
+
+    #[test]
+    fn renders_tool_definitions_without_coupling_to_json_key_order() {
+        let tools = vec![function_tool("read")];
+        let prompt =
+            render_prompt(&[text_message("user", "Open README.md")], &tools).expect("render tools");
+
+        assert!(prompt.contains("# Tools\n"));
+        assert!(prompt.contains("<tools>\n<tool>"));
+        assert!(prompt.contains(r#""name": "read""#));
+        assert!(prompt.contains("<invoke name=\"tool-name-1\">"));
+        assert_eq!(tool_names(&tools), HashSet::from(["read".to_owned()]));
+    }
+
+    #[test]
+    fn preserves_prior_tool_exchange_but_omits_stale_reasoning() {
+        let mut assistant = text_message("assistant", "");
+        assistant.reasoning_content = Some("private prior reasoning".to_owned());
+        assistant.tool_calls = vec![incoming_call(
+            "weather",
+            json!(r#"{"city":"Paris","days":2}"#),
+        )];
+        let mut tool_result = text_message("tool", "sunny");
+        tool_result.tool_call_id = Some("call_previous".to_owned());
+        let messages = vec![
+            text_message("user", "Check the weather"),
+            assistant,
+            tool_result,
+            text_message("user", "Summarize it"),
+        ];
+
+        let prompt = render_prompt(&messages, &[]).expect("render follow-up");
+        assert!(!prompt.contains("private prior reasoning"));
+        assert!(prompt.contains("<invoke name=\"weather\">"));
+        assert!(prompt.contains("<parameter name=\"city\">Paris</parameter>"));
+        assert!(prompt.contains("<parameter name=\"days\">2</parameter>"));
+        assert!(
+            prompt
+                .contains("]~b]tool\n<response>sunny</response>[e~[\n]~b]user\nSummarize it[e~[\n")
+        );
+    }
+
+    #[test]
+    fn preserves_reasoning_on_the_latest_assistant_turn() {
+        let mut assistant = text_message("assistant", "visible answer");
+        assistant.reasoning_content = Some("latest reasoning".to_owned());
+
+        let prompt = render_prompt(&[text_message("user", "Question"), assistant], &[])
+            .expect("render assistant turn");
+        assert!(
+            prompt.contains("]~b]ai\n<think>\nlatest reasoning\n</think>\n\nvisible answer[e~[\n")
+        );
+    }
+
+    #[test]
+    fn extracts_embedded_reasoning_from_prior_assistant_content() {
+        let assistant = text_message(
+            "assistant",
+            "<think>\nembedded reasoning\n</think>\nvisible answer",
+        );
+
+        let prompt = render_prompt(&[text_message("user", "Question"), assistant], &[])
+            .expect("render embedded reasoning");
+        assert!(
+            prompt
+                .contains("]~b]ai\n<think>\nembedded reasoning\n</think>\n\nvisible answer[e~[\n")
+        );
+    }
+
+    #[test]
+    fn groups_consecutive_tool_results_in_one_native_tool_turn() {
+        let mut assistant = text_message("assistant", "");
+        assistant.tool_calls = vec![
+            incoming_call("first", json!({})),
+            incoming_call("second", json!({})),
+        ];
+        let messages = vec![
+            text_message("user", "Run both"),
+            assistant,
+            text_message("tool", "result A"),
+            text_message("tool", "result B"),
+        ];
+
+        let prompt = render_prompt(&messages, &[]).expect("render tool results");
+        assert_eq!(prompt.matches("]~b]tool").count(), 1);
+        assert!(prompt.contains(
+            "]~b]tool\n<response>result A</response>\n<response>result B</response>[e~[\n"
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_conversations_and_orphan_tool_results() {
+        assert!(
+            render_prompt(&[], &[])
+                .expect_err("empty conversation")
+                .to_string()
+                .contains("messages must not be empty")
+        );
+
+        let mut orphan = text_message("tool", "result");
+        orphan.tool_call_id = Some("call_missing".to_owned());
+        let error = render_prompt(&[text_message("user", "Hi"), orphan], &[])
+            .expect_err("orphan tool result");
+        assert!(
+            error
+                .to_string()
+                .contains("no preceding assistant tool call")
+        );
+        assert!(error.to_string().contains("call_missing"));
+    }
+
+    #[test]
+    fn rejects_non_object_prior_tool_arguments() {
+        let mut assistant = text_message("assistant", "");
+        assistant.tool_calls = vec![incoming_call("read", json!("[1, 2]"))];
+
+        let error = render_prompt(&[text_message("user", "Hi"), assistant], &[])
+            .expect_err("non-object arguments");
+        assert!(
+            error
+                .to_string()
+                .contains("tool-call arguments must be a JSON object")
+        );
+    }
+
+    #[test]
+    fn parses_xml_quote_styles_and_filters_unknown_tools() {
+        let xml = r#"
+            <invoke name='read'>
+                <parameter name=path> README.md </parameter>
+                <parameter name='options'> {"line": 1} </parameter>
+            </invoke>
+            <invoke name="delete"><parameter name="path">README.md</parameter></invoke>
+        "#;
+        let valid_names = HashSet::from(["read".to_owned()]);
+
+        let calls = parse_tool_calls(xml, &valid_names);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(
+            parsed_arguments(&calls[0]),
+            json!({"path": "README.md", "options": "{\"line\": 1}"})
+        );
+    }
+
+    #[test]
+    fn parses_reasoning_visible_content_and_tool_calls_separately() {
+        let raw = concat!(
+            "<think>\nInspect first.\n</think>\n",
+            "Preface\n",
+            "<minimax:tool_call><invoke name=\"read\">",
+            "<parameter name=\"path\">README.md</parameter>",
+            "</invoke></minimax:tool_call>\n",
+            "Suffix"
+        );
+        let valid_names = HashSet::from(["read".to_owned()]);
+
+        let parsed = parse_assistant(raw, &valid_names);
+        assert_eq!(parsed.reasoning.as_deref(), Some("Inspect first."));
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].function.name, "read");
-        assert_eq!(
-            parsed.tool_calls[0].function.arguments,
-            r#"{"path":"README.md"}"#
+        let content = parsed.content.expect("visible content");
+        assert!(content.contains("Preface"));
+        assert!(content.contains("Suffix"));
+        assert!(!content.contains(TOOL_START));
+    }
+
+    #[test]
+    fn parses_a_tool_call_even_without_a_think_end_marker() {
+        let raw = concat!(
+            "Need the file.\n",
+            "<minimax:tool_call><invoke name=\"read\"></invoke>",
+            "</minimax:tool_call>"
         );
+        let valid_names = HashSet::from(["read".to_owned()]);
+
+        let parsed = parse_assistant(raw, &valid_names);
+        assert_eq!(parsed.reasoning.as_deref(), Some("Need the file."));
+        assert_eq!(parsed.content, None);
+        assert_eq!(parsed.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn preserves_unrecognized_tool_markup_as_visible_content() {
+        let raw = concat!(
+            "Plan.\n</think>\n",
+            "<minimax:tool_call><invoke name=\"delete\"></invoke>",
+            "</minimax:tool_call>"
+        );
+        let valid_names = HashSet::from(["read".to_owned()]);
+
+        let parsed = parse_assistant(raw, &valid_names);
+        assert_eq!(parsed.reasoning.as_deref(), Some("Plan."));
+        assert!(parsed.tool_calls.is_empty());
+        let content = parsed.content.expect("unrecognized block remains visible");
+        assert!(content.contains(TOOL_START));
+        assert!(content.contains("name=\"delete\""));
+        assert!(content.contains(TOOL_END));
+    }
+
+    #[test]
+    fn stream_parser_routes_arbitrary_chunks_by_semantic_mode() {
+        let markers = markers();
+        let mut parser = ChatStreamParser::new(markers, HashSet::from(["read".to_owned()]));
+
+        assert!(
+            parser
+                .push(markers.think_start, THINK_START.into())
+                .is_empty()
+        );
+        assert!(matches!(
+            parser.push(99, "reasoning".into()).as_slice(),
+            [StreamDelta::Reasoning(text)] if text == "reasoning"
+        ));
+        assert!(parser.push(markers.think_end, THINK_END.into()).is_empty());
+        assert!(matches!(
+            parser.push(99, "answer".into()).as_slice(),
+            [StreamDelta::Content(text)] if text == "answer"
+        ));
+
+        assert!(
+            parser
+                .push(markers.tool_start, TOOL_START.into())
+                .is_empty()
+        );
+        for chunk in [
+            "<inv",
+            "oke name=\"read\"><parameter name=\"path\">",
+            "README.md</parameter></invoke>",
+        ] {
+            assert!(parser.push(99, chunk.to_owned()).is_empty());
+        }
+        let deltas = parser.push(markers.tool_end, TOOL_END.into());
+        let [StreamDelta::ToolCalls(calls)] = deltas.as_slice() else {
+            panic!("expected a streamed tool call")
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(parsed_arguments(&calls[0]), json!({"path": "README.md"}));
+
+        assert!(matches!(
+            parser.push(99, "after".into()).as_slice(),
+            [StreamDelta::Content(text)] if text == "after"
+        ));
+        assert!(parser.finish().is_empty());
+    }
+
+    #[test]
+    fn stream_parser_preserves_invalid_and_unterminated_tool_blocks() {
+        let markers = markers();
+        let mut parser = ChatStreamParser::new(markers, HashSet::from(["read".to_owned()]));
+        let unknown = "<invoke name=\"delete\"></invoke>";
+
+        parser.push(markers.tool_start, String::new());
+        parser.push(99, unknown.to_owned());
+        assert!(matches!(
+            parser.push(markers.tool_end, String::new()).as_slice(),
+            [StreamDelta::Content(text)]
+                if text == &format!("{TOOL_START}{unknown}{TOOL_END}")
+        ));
+
+        parser.push(markers.tool_start, String::new());
+        parser.push(99, "<invoke name=\"read\">".to_owned());
+        assert!(matches!(
+            parser.finish().as_slice(),
+            [StreamDelta::Content(text)]
+                if text == "<minimax:tool_call><invoke name=\"read\">"
+        ));
+        assert!(parser.finish().is_empty());
     }
 }

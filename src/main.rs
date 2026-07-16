@@ -787,6 +787,24 @@ async fn chat_completions(
                 });
             match generation {
                 Ok(generation) => {
+                    for delta in parser.finish() {
+                        if let chat::StreamDelta::Content(content) = delta {
+                            let _ = send_sse(
+                                &sender,
+                                serde_json::json!({
+                                    "id": id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_name,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"content": content},
+                                        "finish_reason": null
+                                    }]
+                                }),
+                            );
+                        }
+                    }
                     let parsed = chat::parse_assistant(&generation.text, &valid_tool_names);
                     // If an unusual token split prevented the incremental parser
                     // from emitting a completed call, emit it once before finish.
@@ -927,6 +945,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn cache_reuses_common_prefix_after_a_divergence() {
@@ -979,6 +998,106 @@ mod tests {
                 matching_tokens: 3,
                 cached_tokens: 3,
             }
+        );
+    }
+
+    #[test]
+    fn cache_recompute_saturates_for_a_one_token_historical_prompt() {
+        assert_eq!(
+            cache_reuse(&[1], &[1, 2], true),
+            CacheReuse {
+                matching_tokens: 1,
+                cached_tokens: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn completion_prompt_deserialization_supports_openai_input_shapes() {
+        let Prompt::Text(text) = serde_json::from_value(json!("hello")).expect("text prompt")
+        else {
+            panic!("expected text prompt")
+        };
+        assert_eq!(text, "hello");
+
+        let Prompt::Tokens(tokens) =
+            serde_json::from_value(json!([1, 2, 3])).expect("token prompt")
+        else {
+            panic!("expected token prompt")
+        };
+        assert_eq!(tokens, [1, 2, 3]);
+
+        let Prompt::Batch(batch) =
+            serde_json::from_value(json!(["hello", [4, 5]])).expect("mixed prompt batch")
+        else {
+            panic!("expected prompt batch")
+        };
+        assert!(matches!(&batch[0], Prompt::Text(text) if text == "hello"));
+        assert!(matches!(&batch[1], Prompt::Tokens(tokens) if tokens == &[4, 5]));
+    }
+
+    #[test]
+    fn chat_output_limit_honors_openai_alias_precedence() {
+        let request = |limits: serde_json::Value| {
+            let mut value = json!({"messages": [{"role": "user", "content": "hello"}]});
+            value
+                .as_object_mut()
+                .expect("request object")
+                .extend(limits.as_object().expect("limits object").clone());
+            serde_json::from_value::<ChatRequest>(value).expect("chat request")
+        };
+
+        assert_eq!(request(json!({})).output_limit(), DEFAULT_MAX_TOKENS);
+        assert_eq!(
+            request(json!({"max_completion_tokens": 21})).output_limit(),
+            21
+        );
+        assert_eq!(request(json!({"max_tokens": 13})).output_limit(), 13);
+        assert_eq!(
+            request(json!({"max_tokens": 13, "max_completion_tokens": 21})).output_limit(),
+            13
+        );
+    }
+
+    #[test]
+    fn usage_and_finish_reasons_follow_openai_semantics() {
+        let generation = GenerationResult {
+            text: "done".to_owned(),
+            token_count: 3,
+            finish: GenerationFinish::Length,
+            cached_prompt_tokens: 4,
+        };
+
+        let usage = generation_usage(10, &generation);
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 3);
+        assert_eq!(usage.total_tokens, 13);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(|details| details.cached_tokens),
+            Some(4)
+        );
+        assert_eq!(finish_reason(&generation, false), "length");
+        assert_eq!(finish_reason(&generation, true), "tool_calls");
+
+        for finish in [GenerationFinish::Eos, GenerationFinish::Cancelled] {
+            let generation = GenerationResult {
+                text: String::new(),
+                token_count: 0,
+                finish,
+                cached_prompt_tokens: 0,
+            };
+            assert_eq!(finish_reason(&generation, false), "stop");
+        }
+    }
+
+    #[test]
+    fn sse_frames_are_json_lines_terminated_by_a_blank_line() {
+        assert_eq!(
+            sse(&json!({"content": "first\nsecond"})),
+            "data: {\"content\":\"first\\nsecond\"}\n\n"
         );
     }
 }

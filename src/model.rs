@@ -26,6 +26,30 @@ const LAYERS: usize = 62;
 const EXPERTS: usize = 256;
 const TOPK: usize = 8;
 
+fn validate_input_ids(ids: &[u32]) -> Result<()> {
+    if ids.is_empty() {
+        anyhow::bail!("input must contain at least one token")
+    }
+    if let Some((index, id)) = ids.iter().enumerate().find(|(_, id)| **id >= VOCAB as u32) {
+        anyhow::bail!("input token {id} at position {index} is outside vocabulary size {VOCAB}");
+    }
+    Ok(())
+}
+
+fn causal_mask_values(sequence_length: usize, past_length: usize) -> Vec<f32> {
+    (0..sequence_length)
+        .flat_map(|query| {
+            (0..(sequence_length + past_length)).map(move |key| {
+                if key <= query + past_length {
+                    0.0
+                } else {
+                    f32::NEG_INFINITY
+                }
+            })
+        })
+        .collect()
+}
+
 struct Attention {
     q: QMatMul,
     k: QMatMul,
@@ -296,11 +320,7 @@ impl Model {
         Ok(())
     }
     pub fn forward(&mut self, ids: &[u32], pos: usize) -> Result<Tensor> {
-        if let Some((index, id)) = ids.iter().enumerate().find(|(_, id)| **id >= VOCAB as u32) {
-            anyhow::bail!(
-                "input token {id} at position {index} is outside vocabulary size {VOCAB}"
-            );
-        }
+        validate_input_ids(ids)?;
         let input = Tensor::from_slice(ids, (1, ids.len()), &self.devices[0])?;
         let mut x = self.embed.forward(&input)?;
         let l = ids.len();
@@ -308,11 +328,7 @@ impl Model {
         // peer-to-peer for every layer creates unnecessary cross-device stream
         // dependencies and exposed a CUDA race at the layer-30/31 boundary.
         let masks = if l > 1 {
-            let values: Vec<f32> = (0..l)
-                .flat_map(|i| {
-                    (0..(l + pos)).map(move |j| if j <= i + pos { 0.0 } else { f32::NEG_INFINITY })
-                })
-                .collect();
+            let values = causal_mask_values(l, pos);
             Some(
                 self.devices
                     .iter()
@@ -359,5 +375,36 @@ impl Model {
             .squeeze(1)?
             .squeeze(0)?;
         Ok(logits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn causal_mask_allows_the_prefix_and_preceding_chunk_tokens() {
+        let masked = f32::NEG_INFINITY;
+        assert_eq!(
+            causal_mask_values(3, 2),
+            vec![
+                0.0, 0.0, 0.0, masked, masked, // First new token.
+                0.0, 0.0, 0.0, 0.0, masked, // Second new token.
+                0.0, 0.0, 0.0, 0.0, 0.0, // Third new token.
+            ]
+        );
+    }
+
+    #[test]
+    fn input_validation_requires_nonempty_in_vocabulary_sequences() {
+        assert!(validate_input_ids(&[0, VOCAB as u32 - 1]).is_ok());
+
+        let empty = validate_input_ids(&[]).expect_err("empty model input");
+        assert!(empty.to_string().contains("at least one token"));
+
+        let out_of_range =
+            validate_input_ids(&[7, VOCAB as u32]).expect_err("out-of-vocabulary token");
+        assert!(out_of_range.to_string().contains(&VOCAB.to_string()));
+        assert!(out_of_range.to_string().contains("position 1"));
     }
 }

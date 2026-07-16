@@ -35,6 +35,21 @@ pub struct MiniMaxTokenizer {
     pub tool_end: u32,
 }
 
+fn minimax_pre_tokenizer() -> Result<Sequence> {
+    let split = Split::new(
+        SplitPattern::Regex(MINIMAX_PRETOKENIZER_REGEX.to_owned()),
+        SplitDelimiterBehavior::Removed,
+        true,
+    )
+    .map_err(|e| anyhow::anyhow!("MiniMax pre-tokenizer construction failed: {e}"))?;
+    Ok(Sequence::new(vec![
+        PreTokenizerWrapper::Split(split),
+        // The MiniMax regex already performs splitting; ByteLevel should only
+        // encode bytes here rather than applying its GPT-2 regex again.
+        PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, true, false)),
+    ]))
+}
+
 impl MiniMaxTokenizer {
     pub fn from_gguf(path: &Path) -> Result<Self> {
         let mut file = File::open(path)?;
@@ -69,17 +84,7 @@ impl MiniMaxTokenizer {
             .build()
             .map_err(|e| anyhow::anyhow!("BPE construction failed: {e}"))?;
         let mut inner = Tokenizer::new(bpe);
-        let split = Split::new(
-            SplitPattern::Regex(MINIMAX_PRETOKENIZER_REGEX.to_owned()),
-            SplitDelimiterBehavior::Removed,
-            true,
-        )
-        .map_err(|e| anyhow::anyhow!("MiniMax pre-tokenizer construction failed: {e}"))?;
-        let pre_tokenizer = Sequence::new(vec![
-            PreTokenizerWrapper::Split(split),
-            PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, true, false)),
-        ]);
-        inner.with_pre_tokenizer(Some(pre_tokenizer));
+        inner.with_pre_tokenizer(Some(minimax_pre_tokenizer()?));
         inner.with_decoder(Some(ByteLevelDecoder::default()));
         // Control delimiters are special and should disappear when decoding
         // generated text. Thinking and tool-call tags are ordinary added
@@ -131,10 +136,9 @@ impl MiniMaxTokenizer {
             .to_vec())
     }
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
-        Ok(self
-            .inner
+        self.inner
             .decode(ids, true)
-            .map_err(|e| anyhow::anyhow!("decode failed: {e}"))?)
+            .map_err(|e| anyhow::anyhow!("decode failed: {e}"))
     }
 
     pub fn decode_step(&self, state: &mut DecodeState, id: u32) -> Result<Option<String>> {
@@ -153,6 +157,25 @@ impl MiniMaxTokenizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokenizers::{OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer};
+
+    #[test]
+    fn minimax_pre_tokenizer_keeps_canonical_split_boundaries() -> Result<()> {
+        let input = "Hello's 1234!!!\n世界";
+        let mut pretokenized: PreTokenizedString = input.into();
+        minimax_pre_tokenizer()?
+            .pre_tokenize(&mut pretokenized)
+            .map_err(|error| anyhow::anyhow!("pre-tokenization failed: {error}"))?;
+
+        let pieces = pretokenized
+            .get_splits(OffsetReferential::Original, OffsetType::Byte)
+            .into_iter()
+            .map(|(_, (start, end), _)| &input[start..end])
+            .collect::<Vec<_>>();
+        assert_eq!(pieces, ["Hello's", " ", "123", "4", "!!!\n", "世界"]);
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires MiniMax GGUF weights; set MINIMAX_MODEL_DIR"]
     fn gguf_tokenizer_round_trip() -> Result<()> {

@@ -23,11 +23,12 @@ Weights load across two GPUs and startup may take several minutes. Tokenization 
 ## Test
 
 ```bash
+cargo test
 BASE_URL=http://127.0.0.1:8000 ./scripts/test-completion.sh
 cargo test gguf_tokenizer_round_trip -- --ignored
 ```
 
-The tokenizer integration test uses `MINIMAX_MODEL_DIR` and is ignored by default because it requires the external model weights. Model-dependent examples use the same environment variable and `--model` option.
+The default unit suite does not load model weights or initialize CUDA devices. It covers API/chat protocol behavior, tokenizer splitting, cache reuse, causal masking, and shard discovery without asserting GPU or layer placement. The tokenizer integration test uses `MINIMAX_MODEL_DIR` and is ignored by default because it requires the external model weights. Model-dependent examples use the same environment variable and `--model` option.
 
 Endpoints: `/health`, `/v1/models`, `/v1/completions`, and `/v1/chat/completions`.
 
