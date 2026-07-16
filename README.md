@@ -36,5 +36,3 @@ Chat completions support SSE streaming, `reasoning_content`, OpenAI function too
 The implementation uses 512-token parallel prefill chunks. The repaired WMMA MoE path is enabled for prefill batches of at least 192 tokens; shorter batches use the generic parallel CUDA kernel because it has lower fixed overhead.
 
 Each completed request emits an info-level `inference timings` event with prompt/cache token counts, prefill and decode durations, milliseconds per token, tokens per second, total inference time, and finish reason. Prefill throughput counts only the uncached prompt suffix, so cache hits remain distinguishable from model evaluation.
-
-See [PERFORMANCE.md](PERFORMANCE.md) for benchmark results, numerical notes, and the reproducible benchmark commands.
