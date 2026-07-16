@@ -55,6 +55,18 @@ impl Cache {
         self.all_data = None;
     }
 
+    /// Rewind the cache while retaining its allocated backing tensor.
+    pub fn truncate(&mut self, seq_len: usize) -> Result<()> {
+        if seq_len > self.current_seq_len {
+            candle::bail!(
+                "cannot truncate cache from {} to {seq_len}",
+                self.current_seq_len
+            )
+        }
+        self.current_seq_len = seq_len;
+        Ok(())
+    }
+
     pub fn append(&mut self, src: &Tensor) -> Result<()> {
         let seq_len = src.dim(self.dim)?;
         // This doesn't seem very idiomatic but because the creation can fail, it's tricky to use
@@ -147,6 +159,25 @@ impl KvCache {
     pub fn reset(&mut self) {
         self.k.reset();
         self.v.reset();
+    }
+
+    /// Rewind both caches while retaining their allocated backing tensors.
+    pub fn truncate(&mut self, seq_len: usize) -> Result<()> {
+        if self.k.current_seq_len() != self.v.current_seq_len() {
+            candle::bail!(
+                "k/v cache length mismatch: {} vs {}",
+                self.k.current_seq_len(),
+                self.v.current_seq_len()
+            )
+        }
+        if seq_len > self.current_seq_len() {
+            candle::bail!(
+                "cannot truncate kv cache from {} to {seq_len}",
+                self.current_seq_len()
+            )
+        }
+        self.k.truncate(seq_len)?;
+        self.v.truncate(seq_len)
     }
 }
 
@@ -795,6 +826,26 @@ impl ConcatKvCache {
 mod tests {
     use super::*;
     use candle::IndexOp;
+
+    #[test]
+    fn test_kv_cache_truncate() -> Result<()> {
+        let device = Device::Cpu;
+        let mut cache = KvCache::new(2, 8);
+        let k = Tensor::zeros((1, 2, 5, 4), DType::F32, &device)?;
+        let v = Tensor::zeros((1, 2, 5, 4), DType::F32, &device)?;
+        cache.append(&k, &v)?;
+
+        cache.truncate(3)?;
+        assert_eq!(cache.current_seq_len(), 3);
+        assert_eq!(cache.k()?.unwrap().dim(2)?, 3);
+        assert_eq!(cache.v()?.unwrap().dim(2)?, 3);
+
+        let next = Tensor::zeros((1, 2, 2, 4), DType::F32, &device)?;
+        cache.append(&next, &next)?;
+        assert_eq!(cache.current_seq_len(), 5);
+        assert!(cache.truncate(6).is_err());
+        Ok(())
+    }
 
     #[test]
     fn test_scattered_kv_cache() -> Result<()> {

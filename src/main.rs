@@ -49,10 +49,38 @@ const MAX_CONTEXT: usize = 196_608;
 
 struct ModelState {
     model: model::Model,
-    /// KV cache contents. A later agent/tool turn commonly extends this exact
-    /// token prefix, so retain it instead of re-prefilling the whole session.
+    /// Token IDs represented by every layer's KV cache. Follow-up prompts can
+    /// reuse any exact prefix of these IDs after rewinding the cache.
     cached_ids: Vec<u32>,
     next_logits: Option<Tensor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheReuse {
+    matching_tokens: usize,
+    cached_tokens: usize,
+}
+
+fn cache_reuse(prompt: &[u32], cached: &[u32], has_next_logits: bool) -> CacheReuse {
+    let matching_tokens = prompt
+        .iter()
+        .zip(cached)
+        .take_while(|(prompt_id, cached_id)| prompt_id == cached_id)
+        .count();
+
+    // If the new prompt ends inside the old cache, logits for its final token
+    // are no longer available. Rewind one extra token and evaluate it again.
+    let needs_historical_logits =
+        matching_tokens == prompt.len() && (matching_tokens < cached.len() || !has_next_logits);
+    let cached_tokens = if needs_historical_logits {
+        matching_tokens.saturating_sub(1)
+    } else {
+        matching_tokens
+    };
+    CacheReuse {
+        matching_tokens,
+        cached_tokens,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,19 +265,27 @@ impl Engine {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("model is not loaded"))?;
 
-        let reusable = !state.cached_ids.is_empty()
-            && prompt.len() >= state.cached_ids.len()
-            && prompt.starts_with(&state.cached_ids)
-            && state.next_logits.is_some();
-        let cached_prompt_tokens = if reusable { state.cached_ids.len() } else { 0 };
-        if !reusable {
+        let previous_cache_tokens = state.cached_ids.len();
+        let reuse = cache_reuse(prompt, &state.cached_ids, state.next_logits.is_some());
+        let cached_prompt_tokens = reuse.cached_tokens;
+        if cached_prompt_tokens == 0 {
             state.model.reset();
             state.cached_ids.clear();
+            state.next_logits = None;
+        } else if cached_prompt_tokens < previous_cache_tokens {
+            // Chat rendering can omit old reasoning or canonicalize tool-call
+            // XML, so a follow-up often diverges near the end of an otherwise
+            // reusable cache. Keep the exact common prefix instead of throwing
+            // the entire session away.
+            state.model.truncate_cache(cached_prompt_tokens)?;
+            state.cached_ids.truncate(cached_prompt_tokens);
             state.next_logits = None;
         }
         debug!(
             request_id,
             prompt_tokens = prompt.len(),
+            previous_cache_tokens,
+            matching_prefix_tokens = reuse.matching_tokens,
             cached_prompt_tokens,
             "starting generation"
         );
@@ -260,7 +296,11 @@ impl Engine {
         // separated timings.
         let prefill_tokens = prompt.len() - state.cached_ids.len();
         let prefill_started = Instant::now();
-        let mut next = state.next_logits.clone();
+        let mut next = if prefill_tokens == 0 {
+            state.next_logits.clone()
+        } else {
+            None
+        };
         for chunk in prompt[state.cached_ids.len()..].chunks(PREFILL_CHUNK) {
             let offset = state.cached_ids.len();
             next = Some(state.model.forward(chunk, offset)?);
@@ -882,4 +922,63 @@ async fn main() -> Result<()> {
     info!(address = %args.host, "MiniMax server listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_reuses_common_prefix_after_a_divergence() {
+        assert_eq!(
+            cache_reuse(&[1, 2, 3, 9, 10], &[1, 2, 3, 4, 5], true),
+            CacheReuse {
+                matching_tokens: 3,
+                cached_tokens: 3,
+            }
+        );
+        assert_eq!(
+            cache_reuse(&[8, 9], &[1, 2, 3], true),
+            CacheReuse {
+                matching_tokens: 0,
+                cached_tokens: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn cache_recomputes_last_token_when_historical_logits_are_missing() {
+        assert_eq!(
+            cache_reuse(&[1, 2, 3], &[1, 2, 3, 4], true),
+            CacheReuse {
+                matching_tokens: 3,
+                cached_tokens: 2,
+            }
+        );
+        assert_eq!(
+            cache_reuse(&[1, 2, 3], &[1, 2, 3], false),
+            CacheReuse {
+                matching_tokens: 3,
+                cached_tokens: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn cache_keeps_full_prefix_when_current_logits_are_usable() {
+        assert_eq!(
+            cache_reuse(&[1, 2, 3, 4], &[1, 2, 3], false),
+            CacheReuse {
+                matching_tokens: 3,
+                cached_tokens: 3,
+            }
+        );
+        assert_eq!(
+            cache_reuse(&[1, 2, 3], &[1, 2, 3], true),
+            CacheReuse {
+                matching_tokens: 3,
+                cached_tokens: 3,
+            }
+        );
+    }
 }

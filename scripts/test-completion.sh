@@ -48,6 +48,31 @@ assert response["choices"][0]["finish_reason"] == "length"
 assert response["usage"]["prompt_tokens"] == 39, response["usage"]
 print(json.dumps(response, ensure_ascii=False))
 '
+printf '\n%s\n' '== partial-prefix KV reuse =='
+python3 - "$BASE_URL" <<'PY'
+import json
+import sys
+import urllib.request
+
+base_url = sys.argv[1]
+
+def complete(prompt):
+    request = urllib.request.Request(
+        base_url + "/v1/completions",
+        data=json.dumps({"prompt": prompt, "max_tokens": 0, "temperature": 0}).encode(),
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=600) as response:
+        return json.load(response)
+
+prefix = [777] * 39
+assert complete(prefix)["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+assert complete(prefix + [778, 779])["usage"]["prompt_tokens_details"]["cached_tokens"] == 39
+response = complete(prefix + [780])
+assert response["usage"]["prompt_tokens_details"]["cached_tokens"] == 39, response
+print(json.dumps(response))
+PY
 printf '\n%s\n' '== native tool call =='
 curl --fail-with-body -sS \
   -X POST "$BASE_URL/v1/chat/completions" \

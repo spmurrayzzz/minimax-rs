@@ -281,6 +281,12 @@ impl Model {
             layer.reset();
         }
     }
+    pub fn truncate_cache(&mut self, seq_len: usize) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.attn.cache.truncate(seq_len)?;
+        }
+        Ok(())
+    }
     pub fn forward(&mut self, ids: &[u32], pos: usize) -> Result<Tensor> {
         if let Some((index, id)) = ids.iter().enumerate().find(|(_, id)| **id >= VOCAB as u32) {
             anyhow::bail!(

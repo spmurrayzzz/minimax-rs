@@ -31,7 +31,7 @@ The tokenizer integration test uses `MINIMAX_MODEL_DIR` and is ignored by defaul
 
 Endpoints: `/health`, `/v1/models`, `/v1/completions`, and `/v1/chat/completions`.
 
-Chat completions support SSE streaming, `reasoning_content`, OpenAI function tools, MiniMax XML tool-call parsing, prior assistant/tool turns, and both `max_tokens` and `max_completion_tokens`. The default output limit is 131,072 tokens. Exact-prefix KV reuse accelerates subsequent agent/tool turns and is reported as `usage.prompt_tokens_details.cached_tokens`.
+Chat completions support SSE streaming, `reasoning_content`, OpenAI function tools, MiniMax XML tool-call parsing, prior assistant/tool turns, and both `max_tokens` and `max_completion_tokens`. The default output limit is 131,072 tokens. Longest-common-token-prefix KV reuse accelerates subsequent agent/tool turns and is reported as `usage.prompt_tokens_details.cached_tokens`.
 
 The implementation uses 512-token parallel prefill chunks. The repaired WMMA MoE path is enabled for prefill batches of at least 192 tokens; shorter batches use the generic parallel CUDA kernel because it has lower fixed overhead.
 

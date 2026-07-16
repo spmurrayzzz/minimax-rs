@@ -50,7 +50,7 @@ Full startup loads roughly 128 GB of weights and can take several minutes. Do no
 - The model uses GQA, Q/K RMSNorm, 64-dimension partial RoPE, KV caching, and top-8-of-256 MoE routing. RoPE tables must be constructed in F32; F16 position construction loses precision after 2048 and overflows below the 196K context limit.
 - Preserve the OpenAI-compatible `/v1/completions` and `/v1/chat/completions` interfaces. Chat SSE must emit each token as it is generated; never regress to buffering the full response.
 - MiniMax tool use requires rendering the native `# Tools`/`<tools>` system section and parsing `<minimax:tool_call><invoke ...>` output into OpenAI `tool_calls`. Preserve `reasoning_content`, prior assistant tool calls, and `tool` result messages.
-- The model state retains an exact token-prefix KV cache across requests. Agent follow-up turns should report a nonzero `usage.prompt_tokens_details.cached_tokens`; reset safely whenever the new prompt does not extend the cached IDs.
+- The model state retains an exact token-prefix KV cache across requests. Rewind every layer to the longest common token prefix when a prompt diverges, and reset only when no prefix is reusable. Agent follow-up turns should report a nonzero `usage.prompt_tokens_details.cached_tokens`.
 
 ## Validation expectations
 

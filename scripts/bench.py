@@ -44,8 +44,10 @@ def stream_request(base_url: str, prompt: list[int], max_tokens: int) -> dict:
                 content_events.append(now)
     end = time.perf_counter()
     span = content_events[-1] - content_events[0] if len(content_events) > 1 else 0.0
+    prompt_details = (usage or {}).get("prompt_tokens_details") or {}
     return {
         "prompt_tokens": len(prompt),
+        "cached_prompt_tokens": prompt_details.get("cached_tokens"),
         "completion_tokens": (usage or {}).get("completion_tokens"),
         "ttft_s": None if first_content is None else first_content - start,
         "total_s": end - start,
@@ -67,13 +69,13 @@ def main() -> None:
         parser.error("--length must be positive")
 
     for run in range(args.repeats):
-        # Change the final id so a previous exact-prefix cache cannot apply.
+        # Change the first id so no common token prefix can be reused.
         prompt = [args.token] * args.length
-        prompt[-1] = args.token + run
-        print(
-            json.dumps(stream_request(args.base_url, prompt, args.max_tokens)),
-            flush=True,
-        )
+        prompt[0] = args.token + run
+        result = stream_request(args.base_url, prompt, args.max_tokens)
+        if result["cached_prompt_tokens"] != 0:
+            raise RuntimeError(f"benchmark request was cached: {result}")
+        print(json.dumps(result), flush=True)
 
 
 if __name__ == "__main__":
