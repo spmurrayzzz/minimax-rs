@@ -40,9 +40,43 @@ curl --fail-with-body -sS \
 import json, sys
 response = json.load(sys.stdin)
 expected = "The user says \"test\". This is a simple test message. The assistant should respond appropriately. There\x27s no policy violation."
-actual = response["choices"][0]["message"]["content"]
+message = response["choices"][0]["message"]
+actual = message["reasoning_content"]
 assert actual == expected, (actual, expected)
+assert message["content"] is None
+assert response["choices"][0]["finish_reason"] == "length"
 assert response["usage"]["prompt_tokens"] == 39, response["usage"]
+print(json.dumps(response, ensure_ascii=False))
+'
+printf '\n%s\n' '== native tool call =='
+curl --fail-with-body -sS \
+  -X POST "$BASE_URL/v1/chat/completions" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "MiniMax-M2.7",
+    "messages": [{"role": "user", "content": "Open README.md. You must use the read tool."}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "read",
+        "description": "Read a file",
+        "parameters": {
+          "type": "object",
+          "properties": {"path": {"type": "string"}},
+          "required": ["path"]
+        }
+      }
+    }],
+    "max_tokens": 128,
+    "temperature": 0
+  }' | python3 -c '
+import json, sys
+response = json.load(sys.stdin)
+choice = response["choices"][0]
+assert choice["finish_reason"] == "tool_calls", choice
+call = choice["message"]["tool_calls"][0]
+assert call["function"]["name"] == "read", call
+assert json.loads(call["function"]["arguments"])["path"] == "README.md", call
 print(json.dumps(response, ensure_ascii=False))
 '
 printf '\n'

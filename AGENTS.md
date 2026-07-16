@@ -45,7 +45,9 @@ Full startup loads roughly 128 GB of weights and can take several minutes. Do no
 - The tokenizer is reconstructed exclusively from GGUF metadata. `tokenizer.ggml.pre=minimax-m2` requires the MiniMax/GPT-4o split regex followed by byte-level encoding with `use_regex=false`; generic GPT-2 byte-level splitting is not equivalent.
 - Use `CUDA_COMPUTE_CAP=120f` for builds on the development box.
 - The model uses GQA, Q/K RMSNorm, 64-dimension partial RoPE, KV caching, and top-8-of-256 MoE routing. RoPE tables must be constructed in F32; F16 position construction loses precision after 2048 and overflows below the 196K context limit.
-- Preserve the OpenAI-compatible `/v1/completions` and `/v1/chat/completions` interfaces.
+- Preserve the OpenAI-compatible `/v1/completions` and `/v1/chat/completions` interfaces. Chat SSE must emit each token as it is generated; never regress to buffering the full response.
+- MiniMax tool use requires rendering the native `# Tools`/`<tools>` system section and parsing `<minimax:tool_call><invoke ...>` output into OpenAI `tool_calls`. Preserve `reasoning_content`, prior assistant tool calls, and `tool` result messages.
+- The model state retains an exact token-prefix KV cache across requests. Agent follow-up turns should report a nonzero `usage.prompt_tokens_details.cached_tokens`; reset safely whenever the new prompt does not extend the cached IDs.
 
 ## Validation expectations
 
@@ -71,5 +73,5 @@ Both implementations decode these to `The user says "test". This is a simple tes
 ## Current limitations
 
 - Sampling is currently greedy; temperature/top-p/top-k are not fully implemented.
-- Streaming support is basic and should be tested with the client that consumes it.
+- Requests are serialized through one model/KV-cache mutex; concurrent scheduling is not implemented.
 - Compare logits or generated tokens against llama.cpp when changing model math or CUDA kernels.

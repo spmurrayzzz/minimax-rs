@@ -22,6 +22,10 @@ const MINIMAX_PRETOKENIZER_REGEX: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}
 pub struct MiniMaxTokenizer {
     inner: Tokenizer,
     pub eos: u32,
+    pub think_start: u32,
+    pub think_end: u32,
+    pub tool_start: u32,
+    pub tool_end: u32,
 }
 
 impl MiniMaxTokenizer {
@@ -70,29 +74,46 @@ impl MiniMaxTokenizer {
         ]);
         inner.with_pre_tokenizer(Some(pre_tokenizer));
         inner.with_decoder(Some(ByteLevelDecoder::default()));
-        let specials = [
-            "]~!b[",
-            "]~b]",
-            "[e~[",
-            "]!d~[",
-            "<think>",
-            "</think>",
-            "[PAD200063]",
-            "<minimax:tool_call>",
-            "</minimax:tool_call>",
-        ];
+        // Control delimiters are special and should disappear when decoding
+        // generated text. Thinking and tool-call tags are ordinary added
+        // tokens in the upstream tokenizer and must remain visible to parsers.
+        let specials = ["]~!b[", "]~b]", "[e~[", "]!d~[", "[PAD200063]"];
         inner.add_special_tokens(
             &specials
                 .iter()
                 .map(|s| AddedToken::from(*s, true))
                 .collect::<Vec<_>>(),
         );
+        let parser_tokens = [
+            "<think>",
+            "</think>",
+            "<minimax:tool_call>",
+            "</minimax:tool_call>",
+        ];
+        inner.add_tokens(
+            &parser_tokens
+                .iter()
+                .map(|s| AddedToken::from(*s, false))
+                .collect::<Vec<_>>(),
+        );
+        let token_id = |token: &str| {
+            inner
+                .token_to_id(token)
+                .with_context(|| format!("missing tokenizer token {token}"))
+        };
         let eos = content
             .metadata
             .get("tokenizer.ggml.eos_token_id")
             .context("missing eos")?
             .to_u32()?;
-        Ok(Self { inner, eos })
+        Ok(Self {
+            eos,
+            think_start: token_id("<think>")?,
+            think_end: token_id("</think>")?,
+            tool_start: token_id("<minimax:tool_call>")?,
+            tool_end: token_id("</minimax:tool_call>")?,
+            inner,
+        })
     }
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         Ok(self
@@ -125,6 +146,14 @@ mod tests {
         assert_eq!(t.encode("]~b]user").unwrap(), vec![200019, 3995]);
         assert_eq!(t.encode("]~b]ai").unwrap(), vec![200019, 1361]);
         assert_eq!(t.encode("-M").unwrap(), vec![5145]);
+        assert_eq!(t.think_start, 200050);
+        assert_eq!(t.think_end, 200051);
+        assert_eq!(t.tool_start, 200052);
+        assert_eq!(t.tool_end, 200053);
+        assert_eq!(
+            t.decode(&[t.think_end, t.tool_start, t.tool_end]).unwrap(),
+            "</think><minimax:tool_call></minimax:tool_call>"
+        );
         let prompt = "]~!b[]~b]system\nYou are a helpful assistant. Your name is MiniMax-M2.7 and is built by MiniMax.[e~[\n]~b]user\ntest[e~[\n]~b]ai\n<think>\n";
         assert_eq!(
             t.encode(prompt).unwrap(),
