@@ -1,0 +1,30 @@
+[package]
+name = "minimax"
+version = "0.1.0"
+edition = "2024"
+description = "Candle inference server for MiniMax-M2.7 (GGUF)"
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-transformers/cuda"]
+
+[dependencies]
+ahash = "0.8"
+anyhow = "1"
+axum = "0.8"
+candle-core = { version = "0.11", features = ["cuda"] }
+candle-nn = { version = "0.11", features = ["cuda"] }
+candle-transformers = { version = "0.11", features = ["cuda"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tokenizers = "0.21.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[patch.crates-io]
+candle-transformers = { path = "vendor/candle-transformers" }
+candle-kernels = { path = "vendor/candle-kernels" }
+candle-nn = { path = "vendor/candle-nn" }
