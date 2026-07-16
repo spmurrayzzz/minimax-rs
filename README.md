@@ -1,4 +1,4 @@
-# minimax
+# minimax-rs
 
 Custom inference engine for MiniMax-M2.X models in GGUF format. The engine is written in Rust and uses Candle/CUDA for GPU acceleration.
 
