@@ -13,7 +13,12 @@ fn main() -> Result<()> {
     let ptx_path = out_dir.join("ptx.rs");
     let bindings = KernelBuilder::new()
         .source_dir("src") // Scan src/ for .cu files
-        .exclude(&["moe_*.cu", "mmvq_gguf.cu", "mmq_*.cu"]) // Exclude statically compiled kernels from ptx build
+        .exclude(&[
+            "moe_*.cu",
+            "mmvq_gguf.cu",
+            "mmq_*.cu",
+            "decode_attention.cu",
+        ]) // Exclude statically compiled kernels from ptx build
         .arg("--expt-relaxed-constexpr")
         .arg("-std=c++17")
         .arg("-O3")
@@ -40,6 +45,7 @@ fn main() -> Result<()> {
             "src/moe/moe_wmma.cu",
             "src/moe/moe_wmma_gguf.cu",
             "src/mmvq_gguf.cu",
+            "src/decode_attention.cu",
             "src/mmq_gguf/mmq_quantize.cu",
             "src/mmq_gguf/mmq_instance_q4_0.cu",
             "src/mmq_gguf/mmq_instance_q4_1.cu",

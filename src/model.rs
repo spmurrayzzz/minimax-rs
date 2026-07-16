@@ -129,21 +129,29 @@ impl Attention {
         };
         let (k, v) = self.cache.append(&k, &v)?;
 
-        // Group Q heads by their shared KV head. Flattening repetition and
-        // sequence into GEMM's M dimension performs true GQA without copying K
-        // and V six times; it is also much faster for long-context decode.
-        let kv_len = k.dim(2)?;
-        let q = q.reshape((1, KVH, (QH / KVH) * l, HD))?;
-        let mut scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)?
-            * (1.0 / (HD as f64).sqrt()))?
-        .reshape((1, KVH, QH / KVH, l, kv_len))?;
-        if let Some(m) = mask {
-            scores = scores.broadcast_add(&m.to_dtype(scores.dtype())?)?;
-        }
-        let y = candle_nn::ops::softmax_last_dim(&scores)?
-            .reshape((1, KVH, (QH / KVH) * l, kv_len))?
-            .matmul(&v)?
-            .reshape((1, QH, l, HD))?;
+        let y = if l == 1 {
+            // Decode directly from the strided, preallocated cache. The split-K
+            // kernel shares every KV row across its six query heads and performs
+            // online softmax, avoiding both the full K transpose and the
+            // 48-by-context score allocation that dominated long-context decode.
+            candle_nn::fused_attention::gqa_decode_f16_128(&q, &k, &v, 1.0 / (HD as f32).sqrt())?
+        } else {
+            // Group Q heads by their shared KV head. Flattening repetition and
+            // sequence into GEMM's M dimension performs true GQA without copying
+            // K and V six times during chunked prefill.
+            let kv_len = k.dim(2)?;
+            let q = q.reshape((1, KVH, (QH / KVH) * l, HD))?;
+            let mut scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)?
+                * (1.0 / (HD as f64).sqrt()))?
+            .reshape((1, KVH, QH / KVH, l, kv_len))?;
+            if let Some(m) = mask {
+                scores = scores.broadcast_add(&m.to_dtype(scores.dtype())?)?;
+            }
+            candle_nn::ops::softmax_last_dim(&scores)?
+                .reshape((1, KVH, (QH / KVH) * l, kv_len))?
+                .matmul(&v)?
+                .reshape((1, QH, l, HD))?
+        };
         self.o
             .forward(&y.transpose(1, 2)?.contiguous()?.reshape((1, l, QH * HD))?)
     }

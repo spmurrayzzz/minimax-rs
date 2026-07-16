@@ -23,6 +23,7 @@ pub mod cpu_flash_attention;
 pub mod embedding;
 pub mod encoding;
 pub mod func;
+pub mod fused_attention;
 pub mod fused_qkv;
 pub mod group_norm;
 pub mod init;

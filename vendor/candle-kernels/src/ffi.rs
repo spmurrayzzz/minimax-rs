@@ -462,6 +462,20 @@ extern "C" {
         position: i32,
         stream: *mut c_void,
     );
+    pub fn launch_gqa_decode_f16_128(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        partials: *mut c_void,
+        output: *mut c_void,
+        seq_len: i32,
+        q_head_stride: i32,
+        k_head_stride: i32,
+        v_head_stride: i32,
+        num_splits: i32,
+        scale: f32,
+        stream: *mut c_void,
+    );
 
     // ============== Dense GGUF MMQ launchers (from mmq_gguf/) ==============
 
