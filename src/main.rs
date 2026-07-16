@@ -18,6 +18,7 @@ use std::{
     convert::Infallible,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 use tokio::{net::TcpListener, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -75,6 +76,75 @@ struct GenerationResult {
     token_count: usize,
     finish: GenerationFinish,
     cached_prompt_tokens: usize,
+}
+
+struct InferenceMetrics {
+    prompt_tokens: usize,
+    cached_prompt_tokens: usize,
+    prefill_tokens: usize,
+    prefill_time: Duration,
+    decode_tokens: usize,
+    decode_time: Duration,
+}
+
+impl InferenceMetrics {
+    fn log(&self, request_id: &str, finish: GenerationFinish) {
+        let total_tokens = self.prefill_tokens + self.decode_tokens;
+        let total_time = self.prefill_time + self.decode_time;
+        info!(
+            request_id,
+            prompt_tokens = self.prompt_tokens,
+            cached_prompt_tokens = self.cached_prompt_tokens,
+            prefill_tokens = self.prefill_tokens,
+            prefill_time_ms = rounded_metric(duration_ms(self.prefill_time)),
+            prefill_ms_per_token = rounded_metric(milliseconds_per_token(
+                self.prefill_time,
+                self.prefill_tokens,
+            )),
+            prefill_tokens_per_second = rounded_metric(tokens_per_second(
+                self.prefill_time,
+                self.prefill_tokens,
+            )),
+            decode_tokens = self.decode_tokens,
+            decode_time_ms = rounded_metric(duration_ms(self.decode_time)),
+            decode_ms_per_token = rounded_metric(milliseconds_per_token(
+                self.decode_time,
+                self.decode_tokens,
+            )),
+            decode_tokens_per_second = rounded_metric(tokens_per_second(
+                self.decode_time,
+                self.decode_tokens,
+            )),
+            total_tokens,
+            total_time_ms = rounded_metric(duration_ms(total_time)),
+            finish = ?finish,
+            "inference timings"
+        );
+    }
+}
+
+fn rounded_metric(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
+fn milliseconds_per_token(duration: Duration, tokens: usize) -> f64 {
+    if tokens == 0 {
+        0.0
+    } else {
+        duration_ms(duration) / tokens as f64
+    }
+}
+
+fn tokens_per_second(duration: Duration, tokens: usize) -> f64 {
+    if tokens == 0 || duration.is_zero() {
+        0.0
+    } else {
+        tokens as f64 / duration.as_secs_f64()
+    }
 }
 
 /// Owns the loaded execution graph and tokenizer behind the API boundary.
@@ -152,6 +222,7 @@ impl Engine {
     /// generation (normally because the streaming client disconnected).
     fn generate_with<F>(
         &self,
+        request_id: &str,
         prompt: &[u32],
         max_tokens: usize,
         _temperature: f32,
@@ -189,10 +260,18 @@ impl Engine {
             state.next_logits = None;
         }
         debug!(
+            request_id,
             prompt_tokens = prompt.len(),
-            cached_prompt_tokens, "starting generation"
+            cached_prompt_tokens,
+            "starting generation"
         );
 
+        // CUDA launches are asynchronous, so synchronize the final prompt
+        // logits before recording prefill time. The first argmax would impose
+        // the same dependency; doing it here gives prefill and decode cleanly
+        // separated timings.
+        let prefill_tokens = prompt.len() - state.cached_ids.len();
+        let prefill_started = Instant::now();
         let mut next = state.next_logits.clone();
         for chunk in prompt[state.cached_ids.len()..].chunks(PREFILL_CHUNK) {
             let offset = state.cached_ids.len();
@@ -200,15 +279,26 @@ impl Engine {
             state.cached_ids.extend_from_slice(chunk);
         }
         let mut next = next.context("no logits available for prompt")?;
+        if prefill_tokens > 0 {
+            next.device().synchronize()?;
+        }
+        let prefill_time = if prefill_tokens > 0 {
+            prefill_started.elapsed()
+        } else {
+            Duration::ZERO
+        };
         state.next_logits = Some(next.clone());
 
+        let decode_started = Instant::now();
         let mut generated = Vec::new();
         let mut decode_state = tokenizer::DecodeState::default();
         let mut finish = GenerationFinish::Length;
+        let mut logits_pending = false;
         for _ in 0..max_tokens {
             // Reduce the 200k vocabulary on-device; copying every logit over
             // PCIe and scanning it on the CPU costs roughly 0.35 ms/token.
             let id = next.argmax(D::Minus1)?.to_scalar::<u32>()?;
+            logits_pending = false;
             if id == self.tokenizer.eos {
                 finish = GenerationFinish::Eos;
                 break;
@@ -228,16 +318,35 @@ impl Engine {
 
             let offset = state.cached_ids.len();
             next = state.model.forward(&[id], offset)?;
+            logits_pending = true;
             state.cached_ids.push(id);
             state.next_logits = Some(next.clone());
         }
+        // Usually the following iteration's scalar argmax synchronizes each
+        // decode step. A length-limited request leaves its last logits pending,
+        // so wait for them before calculating throughput and releasing the
+        // cache to the next request.
+        if logits_pending {
+            next.device().synchronize()?;
+        }
+        let decode_time = decode_started.elapsed();
 
-        Ok(GenerationResult {
+        let result = GenerationResult {
             text: self.tokenizer.decode(&generated)?,
             token_count: generated.len(),
             finish,
             cached_prompt_tokens,
-        })
+        };
+        InferenceMetrics {
+            prompt_tokens: prompt.len(),
+            cached_prompt_tokens,
+            prefill_tokens,
+            prefill_time,
+            decode_tokens: result.token_count,
+            decode_time,
+        }
+        .log(request_id, finish);
+        Ok(result)
     }
 }
 
@@ -455,8 +564,12 @@ async fn completions(
         let stream_model = model_name.clone();
         tokio::task::spawn_blocking(move || {
             let token_sender = sender.clone();
-            let generation =
-                engine.generate_with(&prompt, max_tokens, temperature, move |_token, text| {
+            let generation = engine.generate_with(
+                &id,
+                &prompt,
+                max_tokens,
+                temperature,
+                move |_token, text| {
                     text.is_empty()
                         || send_sse(
                             &token_sender,
@@ -473,7 +586,8 @@ async fn completions(
                                 }]
                             }),
                         )
-                });
+                },
+            );
             match generation {
                 Ok(generation) => {
                     let final_chunk = serde_json::json!({
@@ -504,8 +618,15 @@ async fn completions(
     }
 
     let engine = state.engine.clone();
+    let request_id = id.clone();
     let generation = match tokio::task::spawn_blocking(move || {
-        engine.generate_with(&prompt, max_tokens, temperature, |_token, _text| true)
+        engine.generate_with(
+            &request_id,
+            &prompt,
+            max_tokens,
+            temperature,
+            |_token, _text| true,
+        )
     })
     .await
     {
@@ -590,51 +711,52 @@ async fn chat_completions(
             let mut parser = chat::ChatStreamParser::new(markers, valid_tool_names.clone());
             let mut streamed_tool_calls = false;
             let token_sender = sender.clone();
-            let generation = engine.generate_with(&ids, max_tokens, temperature, |token, text| {
-                for delta in parser.push(token, text) {
-                    let delta = match delta {
-                        chat::StreamDelta::Reasoning(reasoning) => {
-                            serde_json::json!({"reasoning_content": reasoning})
-                        }
-                        chat::StreamDelta::Content(content) => {
-                            serde_json::json!({"content": content})
-                        }
-                        chat::StreamDelta::ToolCalls(calls) => {
-                            streamed_tool_calls = true;
-                            let calls = calls
-                                .into_iter()
-                                .enumerate()
-                                .map(|(index, call)| {
-                                    serde_json::json!({
-                                        "index": index,
-                                        "id": call.id,
-                                        "type": call.r#type,
-                                        "function": call.function
+            let generation =
+                engine.generate_with(&id, &ids, max_tokens, temperature, |token, text| {
+                    for delta in parser.push(token, text) {
+                        let delta = match delta {
+                            chat::StreamDelta::Reasoning(reasoning) => {
+                                serde_json::json!({"reasoning_content": reasoning})
+                            }
+                            chat::StreamDelta::Content(content) => {
+                                serde_json::json!({"content": content})
+                            }
+                            chat::StreamDelta::ToolCalls(calls) => {
+                                streamed_tool_calls = true;
+                                let calls = calls
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(index, call)| {
+                                        serde_json::json!({
+                                            "index": index,
+                                            "id": call.id,
+                                            "type": call.r#type,
+                                            "function": call.function
+                                        })
                                     })
-                                })
-                                .collect::<Vec<_>>();
-                            serde_json::json!({"tool_calls": calls})
+                                    .collect::<Vec<_>>();
+                                serde_json::json!({"tool_calls": calls})
+                            }
+                        };
+                        if !send_sse(
+                            &token_sender,
+                            serde_json::json!({
+                                "id": stream_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": stream_model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": delta,
+                                    "finish_reason": null
+                                }]
+                            }),
+                        ) {
+                            return false;
                         }
-                    };
-                    if !send_sse(
-                        &token_sender,
-                        serde_json::json!({
-                            "id": stream_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": stream_model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": delta,
-                                "finish_reason": null
-                            }]
-                        }),
-                    ) {
-                        return false;
                     }
-                }
-                true
-            });
+                    true
+                });
             match generation {
                 Ok(generation) => {
                     let parsed = chat::parse_assistant(&generation.text, &valid_tool_names);
@@ -700,8 +822,15 @@ async fn chat_completions(
     }
 
     let engine = state.engine.clone();
+    let request_id = id.clone();
     let generation = match tokio::task::spawn_blocking(move || {
-        engine.generate_with(&ids, max_tokens, temperature, |_token, _text| true)
+        engine.generate_with(
+            &request_id,
+            &ids,
+            max_tokens,
+            temperature,
+            |_token, _text| true,
+        )
     })
     .await
     {
