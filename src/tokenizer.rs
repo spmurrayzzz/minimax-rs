@@ -154,8 +154,18 @@ impl MiniMaxTokenizer {
 mod tests {
     use super::*;
     #[test]
-    fn gguf_tokenizer_round_trip() {
-        let t = MiniMaxTokenizer::from_gguf(Path::new("/storage/models/minimax-m2.7-gguf/UD-Q4_K_XL/MiniMax-M2.7-UD-Q4_K_XL-00001-of-00004.gguf")).unwrap();
+    #[ignore = "requires MiniMax GGUF weights; set MINIMAX_MODEL_DIR"]
+    fn gguf_tokenizer_round_trip() -> Result<()> {
+        let model_dir = std::env::var_os(minimax::model_files::MODEL_DIR_ENV)
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} must point to the directory containing the GGUF shards",
+                    minimax::model_files::MODEL_DIR_ENV
+                )
+            })?;
+        let shards = minimax::model_files::discover_gguf_shards(&model_dir)?;
+        let t = MiniMaxTokenizer::from_gguf(&shards[0])?;
         let ids = t.encode("test").unwrap();
         println!("test ids={ids:?} decoded={:?}", t.decode(&ids).unwrap());
         assert_eq!(t.decode(&ids).unwrap(), "test");
@@ -190,5 +200,6 @@ mod tests {
                 1352, 7623, 36238, 46, 25209, 687, 5177, 23077, 46,
             ]
         );
+        Ok(())
     }
 }

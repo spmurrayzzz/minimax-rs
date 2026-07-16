@@ -29,7 +29,7 @@ use uuid::Uuid;
 #[command(name = "minimax-server", about = "MiniMax-M2.7 GGUF inference server")]
 struct Args {
     /// Directory containing the four split GGUF files.
-    #[arg(long, default_value = "/storage/models/minimax-m2.7-gguf/UD-Q4_K_XL")]
+    #[arg(long, env = "MINIMAX_MODEL_DIR", value_name = "DIR")]
     model: PathBuf,
     #[arg(long, default_value = "127.0.0.1:8080")]
     host: String,
@@ -156,19 +156,7 @@ struct Engine {
 
 impl Engine {
     fn open(model_dir: &Path, load_model: bool) -> Result<Self> {
-        let mut shards: Vec<_> = std::fs::read_dir(model_dir)
-            .with_context(|| format!("cannot read model directory {}", model_dir.display()))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "gguf"))
-            .collect();
-        shards.sort();
-        if shards.len() != 4 {
-            bail!(
-                "expected 4 split GGUF files in {}, found {}",
-                model_dir.display(),
-                shards.len()
-            );
-        }
+        let shards = minimax::model_files::discover_gguf_shards(model_dir)?;
 
         let mut tensors = 0usize;
         for (i, path) in shards.iter().enumerate() {

@@ -393,10 +393,35 @@ impl CudaStream {
 #[cfg(test)]
 mod tests {
     #[allow(unused_imports)]
-    use std::{fs, vec::Vec};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        vec::Vec,
+    };
 
     use super::*;
     use crate::driver::*;
+
+    struct TestPath(PathBuf);
+
+    impl TestPath {
+        fn new(name: &str) -> Self {
+            Self(
+                std::env::temp_dir()
+                    .join(format!("cudarc-cufile-test-{name}-{}", std::process::id())),
+            )
+        }
+
+        fn as_path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestPath {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
 
     #[test]
     fn test_cufile_sync_dtof() -> Result<(), CufileError> {
@@ -404,7 +429,8 @@ mod tests {
         let stream = ctx.new_stream().unwrap();
         let cufile = Cufile::new()?;
 
-        let file = std::fs::File::create("/tmp/cudarc-cufile-test_dtof_sync").unwrap();
+        let path = TestPath::new("dtof-sync");
+        let file = std::fs::File::create(path.as_path()).unwrap();
         let mut handle = cufile.register(file)?;
 
         let data = [0u8, 1, 2, 3, 4];
@@ -412,7 +438,7 @@ mod tests {
         let written = handle.sync_write(0, &buf)?;
         assert_eq!(written, data.len() as isize);
 
-        let buf = std::fs::read("/tmp/cudarc-cufile-test_dtof_sync").unwrap();
+        let buf = std::fs::read(path.as_path()).unwrap();
         assert_eq!(&buf, &data);
 
         Ok(())
@@ -425,9 +451,10 @@ mod tests {
         let cufile = Cufile::new()?;
 
         let data = [0u8, 1, 2, 3, 4];
-        fs::write("/tmp/cudarc-cufile-test_ftod_sync", data).unwrap();
+        let path = TestPath::new("ftod-sync");
+        fs::write(path.as_path(), data).unwrap();
 
-        let file = std::fs::File::open("/tmp/cudarc-cufile-test_ftod_sync").unwrap();
+        let file = std::fs::File::open(path.as_path()).unwrap();
         let handle = cufile.register(file)?;
         let mut buf = stream.alloc_zeros::<u8>(data.len()).unwrap();
         let read = handle.sync_read(0, &mut buf)?;
@@ -438,7 +465,7 @@ mod tests {
         assert_eq!(&host_buf, &data);
 
         // NOTE: asserting file is unchanged
-        let buf = fs::read("/tmp/cudarc-cufile-test_ftod_sync").unwrap();
+        let buf = fs::read(path.as_path()).unwrap();
         assert_eq!(&buf, &data);
 
         Ok(())
@@ -465,13 +492,14 @@ mod tests {
         let buf = stream.clone_htod(&data).unwrap();
 
         let cufile = Cufile::new()?;
-        let file = std::fs::File::create("/tmp/cudarc-cufile-test_dtof_async").unwrap();
+        let path = TestPath::new("dtof-async");
+        let file = std::fs::File::create(path.as_path()).unwrap();
         let mut handle = cufile.register(file)?;
         let write_op = stream.memcpy_dtof(&buf, &mut handle, 0).unwrap();
         let written = write_op.synchronize().unwrap();
         assert_eq!(written, data.len() as isize);
 
-        let buf = std::fs::read("/tmp/cudarc-cufile-test_dtof_async").unwrap();
+        let buf = std::fs::read(path.as_path()).unwrap();
         assert_eq!(&buf, &data);
 
         Ok(())
@@ -496,9 +524,10 @@ mod tests {
         for i in 0..(1024 * 1024) {
             data.push((i % 256) as u8);
         }
-        fs::write("/tmp/cudarc-cufile-test_ftod_async", &data).unwrap();
+        let path = TestPath::new("ftod-async");
+        fs::write(path.as_path(), &data).unwrap();
 
-        let file = std::fs::File::open("/tmp/cudarc-cufile-test_ftod_async").unwrap();
+        let file = std::fs::File::open(path.as_path()).unwrap();
         let handle = cufile.register(file)?;
 
         let mut buf = stream.alloc_zeros::<u8>(data.len()).unwrap();
@@ -511,7 +540,7 @@ mod tests {
         assert_eq!(&host_buf, &data);
 
         // NOTE: asserting file is unchanged
-        let buf = std::fs::read("/tmp/cudarc-cufile-test_ftod_async").unwrap();
+        let buf = std::fs::read(path.as_path()).unwrap();
         assert_eq!(&buf, &data);
 
         Ok(())

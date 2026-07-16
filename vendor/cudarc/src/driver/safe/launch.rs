@@ -597,6 +597,37 @@ extern \"C\" __global__ void halfs(__half h) {
 ";
 
     #[cfg(feature = "f16")]
+    fn cuda_include_path() -> String {
+        let include_from_root = |root: std::path::PathBuf| {
+            let include = root.join("include");
+            include.join("cuda_fp16.h").is_file().then_some(include)
+        };
+        let include = [
+            "CUDA_HOME",
+            "CUDA_PATH",
+            "CUDA_ROOT",
+            "CUDA_TOOLKIT_ROOT_DIR",
+        ]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(std::path::PathBuf::from)
+        .find_map(include_from_root)
+        .or_else(|| {
+            let compiler = if cfg!(windows) { "nvcc.exe" } else { "nvcc" };
+            std::env::var_os("PATH")
+                .into_iter()
+                .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+                .map(|directory| directory.join(compiler))
+                .filter(|path| path.is_file())
+                .filter_map(|path| path.canonicalize().ok())
+                .filter_map(|path| path.parent()?.parent().map(std::path::Path::to_path_buf))
+                .find_map(include_from_root)
+        })
+        .expect("cannot find CUDA headers; set CUDA_HOME or CUDA_PATH");
+        include.to_string_lossy().into_owned()
+    }
+
+    #[cfg(feature = "f16")]
     #[test]
     fn test_launch_with_half() {
         use crate::nvrtc::CompileOptions;
@@ -604,7 +635,7 @@ extern \"C\" __global__ void halfs(__half h) {
         let ptx = compile_ptx_with_opts(
             HALF_KERNELS,
             CompileOptions {
-                include_paths: std::vec!["/usr/include".into()],
+                include_paths: std::vec![cuda_include_path()],
                 arch: Some("compute_53"),
                 ..Default::default()
             },

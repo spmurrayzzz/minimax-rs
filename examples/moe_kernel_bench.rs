@@ -1,10 +1,19 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use candle_transformers::{
     fused_moe::{FusedMoeGGUF, MoeCfg},
     quantized_var_builder::VarBuilder,
 };
+use clap::Parser;
+use minimax::model_files::discover_gguf_shards;
 use std::{path::PathBuf, time::Instant};
+
+#[derive(Debug, Parser)]
+struct Args {
+    /// Directory containing the four split GGUF files.
+    #[arg(long, env = "MINIMAX_MODEL_DIR", value_name = "DIR")]
+    model: PathBuf,
+}
 
 const HIDDEN: usize = 3072;
 const INTERMEDIATE: usize = 1536;
@@ -25,16 +34,8 @@ where
 }
 
 fn main() -> Result<()> {
-    let model_dir = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/storage/models/minimax-m2.7-gguf/UD-Q4_K_XL"));
-    let mut shards = std::fs::read_dir(&model_dir)
-        .with_context(|| format!("cannot read {}", model_dir.display()))?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|ext| ext == "gguf"))
-        .collect::<Vec<_>>();
-    shards.sort();
+    let args = Args::parse();
+    let shards = discover_gguf_shards(&args.model)?;
 
     let device = Device::new_cuda(0)?;
     unsafe { device.as_cuda_device()?.disable_event_tracking() };

@@ -8,7 +8,20 @@ use candle_transformers::{
     quantized_var_builder::VarBuilder,
     utils::repeat_kv,
 };
+use clap::Parser;
+use minimax::model_files::discover_gguf_shards;
 use std::{path::PathBuf, sync::Arc, time::Instant};
+
+#[derive(Debug, Parser)]
+struct Args {
+    /// Directory containing the four split GGUF files.
+    #[arg(long, env = "MINIMAX_MODEL_DIR", value_name = "DIR")]
+    model: PathBuf,
+    #[arg(long, default_value_t = 512)]
+    context: usize,
+    #[arg(long, default_value_t = 100)]
+    iterations: usize,
+}
 
 const H: usize = 3072;
 const QH: usize = 48;
@@ -193,22 +206,10 @@ impl Layer {
 }
 
 fn main() -> Result<()> {
-    let context = std::env::args()
-        .nth(1)
-        .as_deref()
-        .unwrap_or("512")
-        .parse::<usize>()?;
-    let iterations = std::env::args()
-        .nth(2)
-        .as_deref()
-        .unwrap_or("100")
-        .parse::<usize>()?;
-    let model_dir = PathBuf::from("/storage/models/minimax-m2.7-gguf/UD-Q4_K_XL");
-    let mut shards = std::fs::read_dir(model_dir)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|ext| ext == "gguf"))
-        .collect::<Vec<_>>();
-    shards.sort();
+    let args = Args::parse();
+    let context = args.context;
+    let iterations = args.iterations;
+    let shards = discover_gguf_shards(&args.model)?;
     let device = Device::new_cuda(0)?;
     // This benchmark intentionally uses one CUDA stream.
     unsafe { device.as_cuda_device()?.disable_event_tracking() };

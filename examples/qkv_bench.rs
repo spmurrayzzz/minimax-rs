@@ -4,7 +4,16 @@ use candle_transformers::{
     models::{quantized_qwen3::RotaryEmbedding, with_tracing::QMatMul},
     quantized_var_builder::VarBuilder,
 };
+use clap::Parser;
+use minimax::model_files::discover_gguf_shards;
 use std::{path::PathBuf, time::Instant};
+
+#[derive(Debug, Parser)]
+struct Args {
+    /// Directory containing the four split GGUF files.
+    #[arg(long, env = "MINIMAX_MODEL_DIR", value_name = "DIR")]
+    model: PathBuf,
+}
 
 const H: usize = 3072;
 const Q: usize = 6144;
@@ -26,12 +35,8 @@ where
 }
 
 fn main() -> Result<()> {
-    let model_dir = PathBuf::from("/storage/models/minimax-m2.7-gguf/UD-Q4_K_XL");
-    let mut shards = std::fs::read_dir(model_dir)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|ext| ext == "gguf"))
-        .collect::<Vec<_>>();
-    shards.sort();
+    let args = Args::parse();
+    let shards = discover_gguf_shards(&args.model)?;
     let device = Device::new_cuda(0)?;
     unsafe { device.as_cuda_device()?.disable_event_tracking() };
     let vb = VarBuilder::from_gguf_selected(&shards, &["blk.0.".to_owned()], &device)?.pp("blk.0");

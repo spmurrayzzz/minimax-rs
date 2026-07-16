@@ -27,7 +27,7 @@ pub struct Config {
 }
 
 impl Config {
-    // /lustre/scwpod02/client/kyutai/alex/mimi_exp/xps/b7d2bd5a/.hydra/config.yaml
+    // Configuration used by the original Mimi v0.1 checkpoint.
     pub fn v0_1(num_codebooks: Option<usize>) -> Self {
         let seanet_cfg = seanet::Config {
             dimension: 512,

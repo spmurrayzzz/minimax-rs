@@ -6,6 +6,8 @@
 
 ## Commands
 
+Commands that access weights require `MINIMAX_MODEL_DIR` or an explicit `--model DIR`. Set the environment variable to the directory containing the four GGUF shards before running them.
+
 Run fast checks after Rust changes:
 
 ```bash
@@ -35,7 +37,7 @@ Full startup loads roughly 128 GB of weights and can take several minutes. Do no
 
 ## Important implementation details
 
-- GGUF shards are in `/storage/models/minimax-m2.7-gguf/UD-Q4_K_XL/` by default.
+- The GGUF shard directory has no built-in filesystem default; supply it through `--model DIR` or `MINIMAX_MODEL_DIR`.
 - Model layers are selectively loaded across both GPUs; shard boundaries can split individual layers.
 - `vendor/candle-transformers` contains the MiniMax sigmoid-router and expert-bias changes.
 - `vendor/candle-kernels` contains a PTX compatibility workaround for the installed CUDA 13.3 toolkit and CUDA 13.2 driver.

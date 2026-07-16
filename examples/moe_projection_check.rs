@@ -1,6 +1,22 @@
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use candle_transformers::quantized_var_builder::VarBuilder;
+use clap::Parser;
+use minimax::model_files::discover_gguf_shards;
+use std::path::PathBuf;
+
+#[derive(Debug, Parser)]
+struct Args {
+    /// Directory containing the four split GGUF files.
+    #[arg(long, env = "MINIMAX_MODEL_DIR", value_name = "DIR")]
+    model: PathBuf,
+    #[arg(long, default_value_t = 0)]
+    layer: usize,
+    #[arg(long, default_value = "gate")]
+    kind: String,
+    #[arg(long, default_value_t = 7)]
+    expert: u32,
+}
 
 const EXPERTS: usize = 256;
 
@@ -21,22 +37,17 @@ fn stats(label: &str, got: &Tensor, reference: &Tensor) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let layer: usize = std::env::args().nth(1).as_deref().unwrap_or("0").parse()?;
-    let kind = std::env::args().nth(2).unwrap_or_else(|| "gate".into());
-    let expert: u32 = std::env::args().nth(3).as_deref().unwrap_or("7").parse()?;
-    let (name, n, k) = match kind.as_str() {
+    let args = Args::parse();
+    let layer = args.layer;
+    let expert = args.expert;
+    let (name, n, k) = match args.kind.as_str() {
         "gate" => ("ffn_gate_exps", 1536, 3072),
         "up" => ("ffn_up_exps", 1536, 3072),
         "down" => ("ffn_down_exps", 3072, 1536),
         other => anyhow::bail!("unknown tensor kind {other}"),
     };
 
-    let dir = std::path::Path::new("/storage/models/minimax-m2.7-gguf/UD-Q4_K_XL");
-    let mut paths: Vec<_> = std::fs::read_dir(dir)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|ext| ext == "gguf"))
-        .collect();
-    paths.sort();
+    let paths = discover_gguf_shards(&args.model)?;
     let device = Device::new_cuda(0)?;
     let tensor_prefix = format!("blk.{layer}.{name}.");
     println!("loading {tensor_prefix} on CUDA:0");
