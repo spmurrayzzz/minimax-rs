@@ -696,7 +696,10 @@ async fn chat_completions(
     } else {
         req.tools.clone()
     };
-    let valid_tool_names = chat::tool_names(&tools);
+    let tool_registry = match chat::ToolRegistry::from_tools(&tools) {
+        Ok(registry) => registry,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
     let prompt = match chat::render_prompt(&req.messages, &tools) {
         Ok(prompt) => prompt,
         Err(error) => return api_error(StatusCode::BAD_REQUEST, &error.to_string()),
@@ -736,7 +739,7 @@ async fn chat_completions(
         let stream_id = id.clone();
         let stream_model = model_name.clone();
         tokio::task::spawn_blocking(move || {
-            let mut parser = chat::ChatStreamParser::new(markers, valid_tool_names.clone());
+            let mut parser = chat::ChatStreamParser::new(markers, tool_registry.clone());
             let mut streamed_tool_calls = false;
             let token_sender = sender.clone();
             let generation =
@@ -805,7 +808,7 @@ async fn chat_completions(
                             );
                         }
                     }
-                    let parsed = chat::parse_assistant(&generation.text, &valid_tool_names);
+                    let parsed = chat::parse_assistant(&generation.text, &tool_registry);
                     // If an unusual token split prevented the incremental parser
                     // from emitting a completed call, emit it once before finish.
                     if !streamed_tool_calls && !parsed.tool_calls.is_empty() {
@@ -884,7 +887,7 @@ async fn chat_completions(
         Ok(Err(error)) => return api_error(StatusCode::SERVICE_UNAVAILABLE, &error.to_string()),
         Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    let parsed = chat::parse_assistant(&generation.text, &valid_tool_names);
+    let parsed = chat::parse_assistant(&generation.text, &tool_registry);
     let reason = finish_reason(&generation, !parsed.tool_calls.is_empty());
     let usage = generation_usage(prompt_tokens, &generation);
     Json(ChatResponse {

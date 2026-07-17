@@ -1,8 +1,13 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use jsonschema::Validator;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::{collections::HashSet, fmt::Write, sync::OnceLock};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Write,
+    sync::OnceLock,
+};
 use uuid::Uuid;
 
 pub const THINK_START: &str = "<think>";
@@ -113,16 +118,49 @@ fn tool_function(tool: &Value) -> Result<&Value> {
         .context("each tool must contain a function object")
 }
 
-pub fn tool_names(tools: &[Value]) -> HashSet<String> {
-    tools
-        .iter()
-        .filter_map(|tool| {
-            tool.get("function")?
-                .get("name")?
-                .as_str()
-                .map(str::to_owned)
-        })
-        .collect()
+#[derive(Clone, Debug)]
+struct ToolDefinition {
+    parameters: Value,
+    validator: Validator,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ToolRegistry {
+    definitions: HashMap<String, ToolDefinition>,
+}
+
+impl ToolRegistry {
+    pub fn from_tools(tools: &[Value]) -> Result<Self> {
+        let mut definitions = HashMap::with_capacity(tools.len());
+        for tool in tools {
+            let function = tool_function(tool)?;
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .context("each tool function must have a string name")?
+                .to_owned();
+            let parameters = function
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Map::new()));
+            let validator = jsonschema::validator_for(&parameters).map_err(|error| {
+                anyhow!("tool {name} has an invalid parameters schema: {error}")
+            })?;
+            if definitions
+                .insert(
+                    name.clone(),
+                    ToolDefinition {
+                        parameters,
+                        validator,
+                    },
+                )
+                .is_some()
+            {
+                bail!("duplicate tool function name: {name}")
+            }
+        }
+        Ok(Self { definitions })
+    }
 }
 
 fn incoming_tool_call(call: &Value) -> Result<(String, Map<String, Value>)> {
@@ -315,53 +353,274 @@ fn parameter_regex() -> &'static Regex {
     })
 }
 
-pub fn parse_tool_calls(xml: &str, valid_names: &HashSet<String>) -> Vec<AssistantToolCall> {
-    let mut calls = Vec::new();
-    for invoke in invoke_regex().captures_iter(xml) {
-        let name = invoke
-            .get(1)
-            .or_else(|| invoke.get(2))
-            .or_else(|| invoke.get(3))
-            .map(|capture| capture.as_str().trim().to_owned())
-            .unwrap_or_default();
-        if name.is_empty() || (!valid_names.is_empty() && !valid_names.contains(&name)) {
-            continue;
+fn local_schema_ref<'a>(root: &'a Value, reference: &str) -> Option<&'a Value> {
+    let pointer = reference.strip_prefix('#')?;
+    if pointer.is_empty() {
+        Some(root)
+    } else {
+        root.pointer(pointer)
+    }
+}
+
+// MiniMax emits schema-declared strings as raw XML text rather than JSON string
+// literals. Mirror llama.cpp's string-schema detection before decoding other
+// parameter bodies as JSON.
+fn schema_resolves_to_string(
+    root: &Value,
+    schema: &Value,
+    visited_refs: &mut HashSet<String>,
+) -> bool {
+    let Some(schema) = schema.as_object() else {
+        return false;
+    };
+
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str)
+        && visited_refs.insert(reference.to_owned())
+        && local_schema_ref(root, reference)
+            .is_some_and(|resolved| schema_resolves_to_string(root, resolved, visited_refs))
+    {
+        return true;
+    }
+
+    match schema.get("type") {
+        Some(Value::String(schema_type)) if schema_type == "string" => return true,
+        Some(Value::Array(schema_types))
+            if schema_types
+                .iter()
+                .any(|schema_type| schema_type == "string") =>
+        {
+            return true;
         }
-        let body = invoke.get(4).map_or("", |capture| capture.as_str());
-        let mut arguments = Map::new();
-        for parameter in parameter_regex().captures_iter(body) {
-            let parameter_name = parameter
-                .get(1)
-                .or_else(|| parameter.get(2))
-                .or_else(|| parameter.get(3))
-                .map(|capture| capture.as_str().trim().to_owned())
-                .unwrap_or_default();
-            if !parameter_name.is_empty() {
-                arguments.insert(
-                    parameter_name,
-                    Value::String(
-                        parameter
-                            .get(4)
-                            .map_or("", |capture| capture.as_str())
-                            .trim()
-                            .to_owned(),
-                    ),
-                );
+        _ => {}
+    }
+
+    for keyword in ["oneOf", "anyOf"] {
+        if schema
+            .get(keyword)
+            .and_then(Value::as_array)
+            .is_some_and(|alternatives| {
+                alternatives.iter().any(|alternative| {
+                    schema_resolves_to_string(root, alternative, &mut visited_refs.clone())
+                })
+            })
+        {
+            return true;
+        }
+    }
+    if schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .is_some_and(|schemas| {
+            !schemas.is_empty()
+                && schemas.iter().all(|schema| {
+                    schema_resolves_to_string(root, schema, &mut visited_refs.clone())
+                })
+        })
+    {
+        return true;
+    }
+    if schema.get("const").is_some_and(Value::is_string)
+        || schema
+            .get("enum")
+            .and_then(Value::as_array)
+            .is_some_and(|values| values.iter().any(Value::is_string))
+        || ["pattern", "minLength", "maxLength"]
+            .iter()
+            .any(|keyword| schema.contains_key(*keyword))
+    {
+        return true;
+    }
+    schema
+        .get("format")
+        .and_then(Value::as_str)
+        .is_some_and(|format| {
+            matches!(
+                format,
+                "date"
+                    | "time"
+                    | "date-time"
+                    | "uri"
+                    | "email"
+                    | "hostname"
+                    | "ipv4"
+                    | "ipv6"
+                    | "uuid"
+            ) || format.starts_with("uuid")
+        })
+}
+
+fn declared_property_schema<'a>(
+    root: &'a Value,
+    schema: &'a Value,
+    name: &str,
+    visited_refs: &mut HashSet<String>,
+) -> Option<&'a Value> {
+    let schema = schema.as_object()?;
+    if let Some(property) = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(name))
+    {
+        return Some(property);
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str)
+        && visited_refs.insert(reference.to_owned())
+        && let Some(resolved) = local_schema_ref(root, reference)
+        && let Some(property) = declared_property_schema(root, resolved, name, visited_refs)
+    {
+        return Some(property);
+    }
+    for keyword in ["allOf", "oneOf", "anyOf"] {
+        if let Some(schemas) = schema.get(keyword).and_then(Value::as_array) {
+            for schema in schemas {
+                if let Some(property) =
+                    declared_property_schema(root, schema, name, &mut visited_refs.clone())
+                {
+                    return Some(property);
+                }
             }
         }
-        calls.push(AssistantToolCall {
-            id: format!("call_{}", Uuid::new_v4().simple()),
-            r#type: "function",
-            function: AssistantFunctionCall {
-                name,
-                arguments: Value::Object(arguments).to_string(),
-            },
-        });
+    }
+    None
+}
+
+fn additional_property_schema<'a>(
+    root: &'a Value,
+    schema: &'a Value,
+    visited_refs: &mut HashSet<String>,
+) -> Option<&'a Value> {
+    let schema = schema.as_object()?;
+    if let Some(additional) = schema.get("additionalProperties")
+        && additional.is_object()
+    {
+        return Some(additional);
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str)
+        && visited_refs.insert(reference.to_owned())
+        && let Some(resolved) = local_schema_ref(root, reference)
+        && let Some(additional) = additional_property_schema(root, resolved, visited_refs)
+    {
+        return Some(additional);
+    }
+    for keyword in ["allOf", "oneOf", "anyOf"] {
+        if let Some(schemas) = schema.get(keyword).and_then(Value::as_array) {
+            for schema in schemas {
+                if let Some(additional) =
+                    additional_property_schema(root, schema, &mut visited_refs.clone())
+                {
+                    return Some(additional);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn decode_parameter(definition: &ToolDefinition, name: &str, raw: &str) -> Option<Value> {
+    let parameter_schema = declared_property_schema(
+        &definition.parameters,
+        &definition.parameters,
+        name,
+        &mut HashSet::new(),
+    )
+    .or_else(|| {
+        additional_property_schema(
+            &definition.parameters,
+            &definition.parameters,
+            &mut HashSet::new(),
+        )
+    });
+
+    if parameter_schema.is_some_and(|schema| {
+        schema_resolves_to_string(&definition.parameters, schema, &mut HashSet::new())
+    }) {
+        return Some(Value::String(raw.to_owned()));
+    }
+    serde_json::from_str(raw).ok().or_else(|| {
+        parameter_schema
+            .is_none()
+            .then(|| Value::String(raw.to_owned()))
+    })
+}
+
+fn parse_invoke(
+    invoke: &regex::Captures<'_>,
+    registry: &ToolRegistry,
+) -> Option<AssistantToolCall> {
+    let name = invoke
+        .get(1)
+        .or_else(|| invoke.get(2))
+        .or_else(|| invoke.get(3))?
+        .as_str()
+        .trim()
+        .to_owned();
+    let definition = registry.definitions.get(&name)?;
+    let body = invoke.get(4).map_or("", |capture| capture.as_str());
+    let mut arguments = Map::new();
+    let mut cursor = 0;
+    for parameter in parameter_regex().captures_iter(body) {
+        let whole_parameter = parameter.get(0)?;
+        if !body[cursor..whole_parameter.start()].trim().is_empty() {
+            return None;
+        }
+        cursor = whole_parameter.end();
+        let parameter_name = parameter
+            .get(1)
+            .or_else(|| parameter.get(2))
+            .or_else(|| parameter.get(3))?
+            .as_str()
+            .trim();
+        if parameter_name.is_empty() || arguments.contains_key(parameter_name) {
+            return None;
+        }
+        let raw = parameter.get(4).map_or("", |capture| capture.as_str());
+        arguments.insert(
+            parameter_name.to_owned(),
+            decode_parameter(definition, parameter_name, raw)?,
+        );
+    }
+    if !body[cursor..].trim().is_empty() {
+        return None;
+    }
+
+    let arguments = Value::Object(arguments);
+    if !definition.validator.is_valid(&arguments) {
+        return None;
+    }
+    Some(AssistantToolCall {
+        id: format!("call_{}", Uuid::new_v4().simple()),
+        r#type: "function",
+        function: AssistantFunctionCall {
+            name,
+            arguments: arguments.to_string(),
+        },
+    })
+}
+
+/// Parse only complete, schema-valid invokes. Invalid native markup remains
+/// ordinary content in the caller and is never exposed as an executable call.
+pub fn parse_tool_calls(xml: &str, registry: &ToolRegistry) -> Vec<AssistantToolCall> {
+    let mut calls = Vec::new();
+    let mut cursor = 0;
+    for invoke in invoke_regex().captures_iter(xml) {
+        let Some(whole_invoke) = invoke.get(0) else {
+            return Vec::new();
+        };
+        if !xml[cursor..whole_invoke.start()].trim().is_empty() {
+            return Vec::new();
+        }
+        cursor = whole_invoke.end();
+        if let Some(call) = parse_invoke(&invoke, registry) {
+            calls.push(call);
+        }
+    }
+    if !xml[cursor..].trim().is_empty() {
+        return Vec::new();
     }
     calls
 }
 
-pub fn parse_assistant(raw: &str, valid_names: &HashSet<String>) -> ParsedAssistant {
+pub fn parse_assistant(raw: &str, registry: &ToolRegistry) -> ParsedAssistant {
     let raw = raw.strip_prefix(THINK_START).unwrap_or(raw);
     let (reasoning, remainder) = if let Some((reasoning, remainder)) = raw.split_once(THINK_END) {
         (reasoning.trim_matches('\n'), remainder)
@@ -385,7 +644,7 @@ pub fn parse_assistant(raw: &str, valid_names: &HashSet<String>) -> ParsedAssist
         };
         let end = body_start + relative_end;
         let block = &remainder[body_start..end];
-        let parsed = parse_tool_calls(block, valid_names);
+        let parsed = parse_tool_calls(block, registry);
         if parsed.is_empty() {
             content.push_str(&remainder[start..end + TOOL_END.len()]);
         } else {
@@ -430,16 +689,16 @@ pub struct ChatStreamParser {
     markers: MarkerIds,
     mode: StreamMode,
     tool_buffer: String,
-    valid_names: HashSet<String>,
+    registry: ToolRegistry,
 }
 
 impl ChatStreamParser {
-    pub fn new(markers: MarkerIds, valid_names: HashSet<String>) -> Self {
+    pub fn new(markers: MarkerIds, registry: ToolRegistry) -> Self {
         Self {
             markers,
             mode: StreamMode::Reasoning,
             tool_buffer: String::new(),
-            valid_names,
+            registry,
         }
     }
 
@@ -458,7 +717,7 @@ impl ChatStreamParser {
         }
         if id == self.markers.tool_end {
             let buffered = std::mem::take(&mut self.tool_buffer);
-            let calls = parse_tool_calls(&buffered, &self.valid_names);
+            let calls = parse_tool_calls(&buffered, &self.registry);
             self.mode = StreamMode::Content;
             return if calls.is_empty() {
                 vec![StreamDelta::Content(format!(
@@ -529,6 +788,80 @@ mod tests {
                     "required": ["path"]
                 }
             }
+        })
+    }
+
+    fn empty_function_tool(name: &str) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            }
+        })
+    }
+
+    fn typed_tool() -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "typed",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "integer": {"type": "integer"},
+                        "number": {"type": "number"},
+                        "boolean": {"type": "boolean"},
+                        "array": {"type": "array", "items": {"type": "integer"}},
+                        "object": {
+                            "type": "object",
+                            "properties": {"nested": {"type": "boolean"}},
+                            "required": ["nested"],
+                            "additionalProperties": false
+                        },
+                        "null": {"type": "null"}
+                    },
+                    "required": [
+                        "text", "integer", "number", "boolean", "array", "object", "null"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        })
+    }
+
+    fn registry(tools: &[Value]) -> ToolRegistry {
+        ToolRegistry::from_tools(tools).expect("valid tool schemas")
+    }
+
+    fn typed_invoke() -> &'static str {
+        concat!(
+            "<invoke name=\"typed\">",
+            "<parameter name=\"text\">  keep\n spaces  </parameter>",
+            "<parameter name=\"integer\">1</parameter>",
+            "<parameter name=\"number\">1.25</parameter>",
+            "<parameter name=\"boolean\">true</parameter>",
+            "<parameter name=\"array\">[1, 2]</parameter>",
+            "<parameter name=\"object\">{\"nested\": false}</parameter>",
+            "<parameter name=\"null\">null</parameter>",
+            "</invoke>"
+        )
+    }
+
+    fn typed_arguments() -> Value {
+        json!({
+            "text": "  keep\n spaces  ",
+            "integer": 1,
+            "number": 1.25,
+            "boolean": true,
+            "array": [1, 2],
+            "object": {"nested": false},
+            "null": null
         })
     }
 
@@ -615,7 +948,7 @@ mod tests {
         assert!(prompt.contains("<tools>\n<tool>"));
         assert!(prompt.contains(r#""name": "read""#));
         assert!(prompt.contains("<invoke name=\"tool-name-1\">"));
-        assert_eq!(tool_names(&tools), HashSet::from(["read".to_owned()]));
+        assert!(registry(&tools).definitions.contains_key("read"));
     }
 
     #[test]
@@ -738,15 +1071,97 @@ mod tests {
             </invoke>
             <invoke name="delete"><parameter name="path">README.md</parameter></invoke>
         "#;
-        let valid_names = HashSet::from(["read".to_owned()]);
+        let registry = registry(&[function_tool("read")]);
 
-        let calls = parse_tool_calls(xml, &valid_names);
+        let calls = parse_tool_calls(xml, &registry);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "read");
         assert_eq!(
             parsed_arguments(&calls[0]),
-            json!({"path": "README.md", "options": "{\"line\": 1}"})
+            json!({"path": " README.md ", "options": {"line": 1}})
         );
+    }
+
+    #[test]
+    fn decodes_tool_parameters_with_the_supplied_schema() {
+        let registry = registry(&[typed_tool()]);
+
+        let calls = parse_tool_calls(typed_invoke(), &registry);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(parsed_arguments(&calls[0]), typed_arguments());
+
+        let raw = format!("</think>{TOOL_START}{}{TOOL_END}", typed_invoke());
+        let parsed = parse_assistant(&raw, &registry);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed_arguments(&parsed.tool_calls[0]), typed_arguments());
+    }
+
+    #[test]
+    fn rejects_malformed_and_schema_invalid_tool_calls() {
+        let registry = registry(&[typed_tool()]);
+        let invalid_calls = [
+            typed_invoke().replace("<parameter name=\"null\">null</parameter>", ""),
+            typed_invoke().replace(
+                "<parameter name=\"integer\">1</parameter>",
+                "<parameter name=\"integer\">1.5</parameter>",
+            ),
+            typed_invoke().replace(
+                "<parameter name=\"array\">[1, 2]</parameter>",
+                "<parameter name=\"array\">[1,</parameter>",
+            ),
+            typed_invoke().replace(
+                "</invoke>",
+                "<parameter name=\"extra\">1</parameter></invoke>",
+            ),
+            typed_invoke().replace(
+                "</invoke>",
+                "<parameter name=\"integer\">2</parameter></invoke>",
+            ),
+            typed_invoke().replace("</invoke>", "<malformed></invoke>"),
+        ];
+
+        for xml in invalid_calls {
+            assert!(
+                parse_tool_calls(&xml, &registry).is_empty(),
+                "invalid call was executable: {xml}"
+            );
+            let raw = format!("</think>{TOOL_START}{xml}{TOOL_END}");
+            let parsed = parse_assistant(&raw, &registry);
+            assert!(parsed.tool_calls.is_empty());
+            assert!(parsed.content.is_some_and(|content| content.contains(&xml)));
+        }
+    }
+
+    #[test]
+    fn validates_schema_valued_additional_properties() {
+        let tool = json!({
+            "type": "function",
+            "function": {
+                "name": "extend",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"label": {"type": "string"}},
+                    "required": ["label"],
+                    "additionalProperties": {"type": "integer"}
+                }
+            }
+        });
+        let registry = registry(&[tool]);
+        let valid = concat!(
+            "<invoke name=\"extend\">",
+            "<parameter name=\"label\"> exact </parameter>",
+            "<parameter name=\"retries\">2</parameter>",
+            "</invoke>"
+        );
+        let calls = parse_tool_calls(valid, &registry);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            parsed_arguments(&calls[0]),
+            json!({"label": " exact ", "retries": 2})
+        );
+
+        let invalid = valid.replace(">2</parameter>", ">two</parameter>");
+        assert!(parse_tool_calls(&invalid, &registry).is_empty());
     }
 
     #[test]
@@ -759,9 +1174,9 @@ mod tests {
             "</invoke></minimax:tool_call>\n",
             "Suffix"
         );
-        let valid_names = HashSet::from(["read".to_owned()]);
+        let registry = registry(&[function_tool("read")]);
 
-        let parsed = parse_assistant(raw, &valid_names);
+        let parsed = parse_assistant(raw, &registry);
         assert_eq!(parsed.reasoning.as_deref(), Some("Inspect first."));
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].function.name, "read");
@@ -778,9 +1193,9 @@ mod tests {
             "<minimax:tool_call><invoke name=\"read\"></invoke>",
             "</minimax:tool_call>"
         );
-        let valid_names = HashSet::from(["read".to_owned()]);
+        let registry = registry(&[empty_function_tool("read")]);
 
-        let parsed = parse_assistant(raw, &valid_names);
+        let parsed = parse_assistant(raw, &registry);
         assert_eq!(parsed.reasoning.as_deref(), Some("Need the file."));
         assert_eq!(parsed.content, None);
         assert_eq!(parsed.tool_calls.len(), 1);
@@ -793,9 +1208,9 @@ mod tests {
             "<minimax:tool_call><invoke name=\"delete\"></invoke>",
             "</minimax:tool_call>"
         );
-        let valid_names = HashSet::from(["read".to_owned()]);
+        let registry = registry(&[function_tool("read")]);
 
-        let parsed = parse_assistant(raw, &valid_names);
+        let parsed = parse_assistant(raw, &registry);
         assert_eq!(parsed.reasoning.as_deref(), Some("Plan."));
         assert!(parsed.tool_calls.is_empty());
         let content = parsed.content.expect("unrecognized block remains visible");
@@ -807,7 +1222,7 @@ mod tests {
     #[test]
     fn stream_parser_routes_arbitrary_chunks_by_semantic_mode() {
         let markers = markers();
-        let mut parser = ChatStreamParser::new(markers, HashSet::from(["read".to_owned()]));
+        let mut parser = ChatStreamParser::new(markers, registry(&[function_tool("read")]));
 
         assert!(
             parser
@@ -852,9 +1267,38 @@ mod tests {
     }
 
     #[test]
+    fn stream_parser_applies_tool_schemas() {
+        let markers = markers();
+        let registry = registry(&[typed_tool()]);
+        let mut parser = ChatStreamParser::new(markers, registry.clone());
+
+        parser.push(markers.tool_start, TOOL_START.to_owned());
+        parser.push(99, typed_invoke().to_owned());
+        let deltas = parser.push(markers.tool_end, TOOL_END.to_owned());
+        let [StreamDelta::ToolCalls(calls)] = deltas.as_slice() else {
+            panic!("expected schema-valid streamed tool call")
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(parsed_arguments(&calls[0]), typed_arguments());
+
+        let invalid = typed_invoke().replace(
+            "<parameter name=\"integer\">1</parameter>",
+            "<parameter name=\"integer\">wrong</parameter>",
+        );
+        let mut parser = ChatStreamParser::new(markers, registry);
+        parser.push(markers.tool_start, TOOL_START.to_owned());
+        parser.push(99, invalid.clone());
+        assert!(matches!(
+            parser.push(markers.tool_end, TOOL_END.to_owned()).as_slice(),
+            [StreamDelta::Content(content)]
+                if content == &format!("{TOOL_START}{invalid}{TOOL_END}")
+        ));
+    }
+
+    #[test]
     fn stream_parser_preserves_invalid_and_unterminated_tool_blocks() {
         let markers = markers();
-        let mut parser = ChatStreamParser::new(markers, HashSet::from(["read".to_owned()]));
+        let mut parser = ChatStreamParser::new(markers, registry(&[function_tool("read")]));
         let unknown = "<invoke name=\"delete\"></invoke>";
 
         parser.push(markers.tool_start, String::new());
