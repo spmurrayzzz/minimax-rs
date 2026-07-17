@@ -36,20 +36,6 @@ fn validate_input_ids(ids: &[u32]) -> Result<()> {
     Ok(())
 }
 
-fn causal_mask_values(sequence_length: usize, past_length: usize) -> Vec<f32> {
-    (0..sequence_length)
-        .flat_map(|query| {
-            (0..(sequence_length + past_length)).map(move |key| {
-                if key <= query + past_length {
-                    0.0
-                } else {
-                    f32::NEG_INFINITY
-                }
-            })
-        })
-        .collect()
-}
-
 struct Attention {
     q: QMatMul,
     k: QMatMul,
@@ -90,12 +76,7 @@ impl Attention {
     fn reset(&mut self) {
         self.cache.reset();
     }
-    fn forward(
-        &mut self,
-        x: &Tensor,
-        mask: Option<&Tensor>,
-        pos: usize,
-    ) -> candle_core::Result<Tensor> {
+    fn forward(&mut self, x: &Tensor, pos: usize) -> candle_core::Result<Tensor> {
         let (_, l, _) = x.dims3()?;
         let (q, k, v) = if l == 1 && self.fused_decode {
             // Decode projects Q/K/V from the same activation. Sharing its Q8_1
@@ -160,21 +141,16 @@ impl Attention {
             // 48-by-context score allocation that dominated long-context decode.
             candle_nn::fused_attention::gqa_decode_f16_128(&q, &k, &v, 1.0 / (HD as f32).sqrt())?
         } else {
-            // Group Q heads by their shared KV head. Flattening repetition and
-            // sequence into GEMM's M dimension performs true GQA without copying
-            // K and V six times during chunked prefill.
-            let kv_len = k.dim(2)?;
-            let q = q.reshape((1, KVH, (QH / KVH) * l, HD))?;
-            let mut scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)?
-                * (1.0 / (HD as f64).sqrt()))?
-            .reshape((1, KVH, QH / KVH, l, kv_len))?;
-            if let Some(m) = mask {
-                scores = scores.broadcast_add(&m.to_dtype(scores.dtype())?)?;
-            }
-            candle_nn::ops::softmax_last_dim(&scores)?
-                .reshape((1, KVH, (QH / KVH) * l, kv_len))?
-                .matmul(&v)?
-                .reshape((1, QH, l, HD))?
+            // Prefill applies the causal boundary inside the split-K online
+            // softmax kernel. Its workspace is bounded by the query chunk and
+            // split count instead of materializing Q-by-context scores.
+            candle_nn::fused_attention::gqa_prefill_f16_128(
+                &q,
+                &k,
+                &v,
+                pos,
+                1.0 / (HD as f32).sqrt(),
+            )?
         };
         self.o
             .forward(&y.transpose(1, 2)?.contiguous()?.reshape((1, l, QH * HD))?)
@@ -213,13 +189,7 @@ impl Layer {
     fn reset(&mut self) {
         self.attn.reset();
     }
-    fn forward(
-        &mut self,
-        x: &Tensor,
-        mask: Option<&Tensor>,
-        pos: usize,
-        prefill: bool,
-    ) -> anyhow::Result<Tensor> {
+    fn forward(&mut self, x: &Tensor, pos: usize, prefill: bool) -> anyhow::Result<Tensor> {
         let x = x.to_device(&self.device)?.to_dtype(DType::F32)?;
         let r = x.clone();
         let n = self
@@ -228,7 +198,7 @@ impl Layer {
             .map_err(|e| anyhow::anyhow!("attn norm: {e}"))?;
         let a = self
             .attn
-            .forward(&n, mask, pos)
+            .forward(&n, pos)
             .map_err(|e| anyhow::anyhow!("attention: {e}"))?
             .to_dtype(DType::F32)?;
         let x = (a + r).map_err(|e| anyhow::anyhow!("attn residual: {e}"))?;
@@ -324,23 +294,6 @@ impl Model {
         let input = Tensor::from_slice(ids, (1, ids.len()), &self.devices[0])?;
         let mut x = self.embed.forward(&input)?;
         let l = ids.len();
-        // Materialize the small causal mask directly on each device. Copying it
-        // peer-to-peer for every layer creates unnecessary cross-device stream
-        // dependencies and exposed a CUDA race at the layer-30/31 boundary.
-        let masks = if l > 1 {
-            let values = causal_mask_values(l, pos);
-            Some(
-                self.devices
-                    .iter()
-                    .map(|device| {
-                        Tensor::from_vec(values.clone(), (1, 1, l, l + pos), device)?
-                            .to_dtype(DType::F16)
-                    })
-                    .collect::<candle_core::Result<Vec<_>>>()?,
-            )
-        } else {
-            None
-        };
         for (layer_index, layer) in self.layers.iter_mut().enumerate() {
             if !x.device().same_device(&layer.device) {
                 // Candle/cudarc's peer-copy stream is not reliably ordered on
@@ -352,10 +305,8 @@ impl Model {
                 x = host.to_device(&layer.device)?;
                 layer.device.synchronize()?;
             }
-            let device_index = usize::from(layer_index >= 31);
-            let mask = masks.as_ref().map(|masks| &masks[device_index]);
             x = layer
-                .forward(&x, mask, pos, l > 1)
+                .forward(&x, pos, l > 1)
                 .map_err(|e| anyhow::anyhow!("layer {layer_index}: {e}"))?;
         }
         let x = x.narrow(1, l - 1, 1)?;
@@ -381,19 +332,6 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn causal_mask_allows_the_prefix_and_preceding_chunk_tokens() {
-        let masked = f32::NEG_INFINITY;
-        assert_eq!(
-            causal_mask_values(3, 2),
-            vec![
-                0.0, 0.0, 0.0, masked, masked, // First new token.
-                0.0, 0.0, 0.0, 0.0, masked, // Second new token.
-                0.0, 0.0, 0.0, 0.0, 0.0, // Third new token.
-            ]
-        );
-    }
 
     #[test]
     fn input_validation_requires_nonempty_in_vocabulary_sequences() {

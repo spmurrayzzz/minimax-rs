@@ -24,34 +24,39 @@ __device__ __forceinline__ float warp_sum(float value) {
     return __shfl_sync(0xffffffff, value, 0);
 }
 
-// Each block owns one KV head and one contiguous sequence split. Its four
-// warps process disjoint positions and share each K/V row across all six query
-// heads. The block emits one online-softmax partial per query head.
-__global__ __launch_bounds__(THREADS, 2) void gqa_decode_split_f16_128(
+// Each block owns one query position, one KV head, and one contiguous causal
+// sequence split. Its four warps process disjoint key positions and share each
+// K/V row across all six GQA query heads. The block emits one online-softmax
+// partial per query head.
+__global__ __launch_bounds__(THREADS, 2) void gqa_split_f16_128(
     const half *__restrict__ q,
     const half *__restrict__ k,
     const half *__restrict__ v,
     float *__restrict__ partials,
-    int seq_len,
+    int past_len,
     int q_head_stride,
+    int q_seq_stride,
     int k_head_stride,
     int v_head_stride,
     int num_splits,
     float scale) {
     const int split = blockIdx.x;
     const int kv_head = blockIdx.y;
+    const int query = blockIdx.z;
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int tid = threadIdx.x;
 
-    const int split_begin = static_cast<int>((static_cast<int64_t>(seq_len) * split) / num_splits);
-    const int split_end = static_cast<int>((static_cast<int64_t>(seq_len) * (split + 1)) / num_splits);
+    const int causal_len = past_len + query + 1;
+    const int split_begin = static_cast<int>((static_cast<int64_t>(causal_len) * split) / num_splits);
+    const int split_end = static_cast<int>((static_cast<int64_t>(causal_len) * (split + 1)) / num_splits);
 
     float2 q_reg[GQA_GROUP][2];
 #pragma unroll
     for (int group = 0; group < GQA_GROUP; ++group) {
         const int q_head = kv_head * GQA_GROUP + group;
-        const half2 *q_ptr = reinterpret_cast<const half2 *>(q + q_head * q_head_stride);
+        const half2 *q_ptr = reinterpret_cast<const half2 *>(
+            q + q_head * q_head_stride + query * q_seq_stride);
         q_reg[group][0] = __half22float2(q_ptr[lane]);
         q_reg[group][1] = __half22float2(q_ptr[32 + lane]);
     }
@@ -148,7 +153,8 @@ __global__ __launch_bounds__(THREADS, 2) void gqa_decode_split_f16_128(
         for (int w = 0; w < WARPS; ++w) {
             value += warp_acc[w][group][tid] * combine_weight[group][w];
         }
-        float *partial = partials + (split * QUERY_HEADS + q_head_base + group) * PARTIAL_STRIDE;
+        float *partial = partials +
+            ((query * num_splits + split) * QUERY_HEADS + q_head_base + group) * PARTIAL_STRIDE;
         partial[2 + tid] = value;
         if (tid == 0) {
             partial[0] = block_max[group];
@@ -159,12 +165,16 @@ __global__ __launch_bounds__(THREADS, 2) void gqa_decode_split_f16_128(
 
 // Merge sequence splits using the same numerically-stable online-softmax
 // representation: (maximum, exponential sum, unnormalised weighted value).
-__global__ __launch_bounds__(THREADS, 2) void gqa_decode_combine_f16_128(
+__global__ __launch_bounds__(THREADS, 2) void gqa_combine_f16_128(
     const float *__restrict__ partials,
     half *__restrict__ output,
+    int query_len,
     int num_splits) {
     const int q_head = blockIdx.x;
+    const int query = blockIdx.y;
     const int dim = threadIdx.x;
+    const float *query_partials =
+        partials + query * num_splits * QUERY_HEADS * PARTIAL_STRIDE;
 
     __shared__ float weights[MAX_SPLITS];
     __shared__ float denominators[MAX_SPLITS];
@@ -174,7 +184,7 @@ __global__ __launch_bounds__(THREADS, 2) void gqa_decode_combine_f16_128(
     if (dim == 0) {
         float max_value = -FLT_MAX;
         for (int split = 0; split < num_splits; ++split) {
-            const float *partial = partials + (split * QUERY_HEADS + q_head) * PARTIAL_STRIDE;
+            const float *partial = query_partials + (split * QUERY_HEADS + q_head) * PARTIAL_STRIDE;
             max_value = fmaxf(max_value, partial[0]);
         }
         global_max = max_value;
@@ -182,7 +192,7 @@ __global__ __launch_bounds__(THREADS, 2) void gqa_decode_combine_f16_128(
     __syncthreads();
 
     if (dim < num_splits) {
-        const float *partial = partials + (dim * QUERY_HEADS + q_head) * PARTIAL_STRIDE;
+        const float *partial = query_partials + (dim * QUERY_HEADS + q_head) * PARTIAL_STRIDE;
         const float weight = partial[1] == 0.0f ? 0.0f : __expf(partial[0] - global_max);
         weights[dim] = weight;
         denominators[dim] = partial[1] * weight;
@@ -200,42 +210,47 @@ __global__ __launch_bounds__(THREADS, 2) void gqa_decode_combine_f16_128(
 
     float value = 0.0f;
     for (int split = 0; split < num_splits; ++split) {
-        const float *partial = partials + (split * QUERY_HEADS + q_head) * PARTIAL_STRIDE;
+        const float *partial = query_partials + (split * QUERY_HEADS + q_head) * PARTIAL_STRIDE;
         value += partial[2 + dim] * weights[split];
     }
-    output[q_head * HEAD_DIM + dim] = __float2half_rn(value / global_sum);
+    output[(q_head * query_len + query) * HEAD_DIM + dim] = __float2half_rn(value / global_sum);
 }
 
 } // namespace
 
-extern "C" void launch_gqa_decode_f16_128(
+extern "C" void launch_gqa_f16_128(
     const void *q,
     const void *k,
     const void *v,
     void *partials,
     void *output,
-    int seq_len,
+    int query_len,
+    int past_len,
     int q_head_stride,
+    int q_seq_stride,
     int k_head_stride,
     int v_head_stride,
     int num_splits,
     float scale,
     void *stream) {
     cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    const dim3 split_grid(num_splits, KV_HEADS);
-    gqa_decode_split_f16_128<<<split_grid, THREADS, 0, cuda_stream>>>(
+    const dim3 split_grid(num_splits, KV_HEADS, query_len);
+    gqa_split_f16_128<<<split_grid, THREADS, 0, cuda_stream>>>(
         static_cast<const half *>(q),
         static_cast<const half *>(k),
         static_cast<const half *>(v),
         static_cast<float *>(partials),
-        seq_len,
+        past_len,
         q_head_stride,
+        q_seq_stride,
         k_head_stride,
         v_head_stride,
         num_splits,
         scale);
-    gqa_decode_combine_f16_128<<<QUERY_HEADS, THREADS, 0, cuda_stream>>>(
+    const dim3 combine_grid(QUERY_HEADS, query_len);
+    gqa_combine_f16_128<<<combine_grid, THREADS, 0, cuda_stream>>>(
         static_cast<const float *>(partials),
         static_cast<half *>(output),
+        query_len,
         num_splits);
 }
