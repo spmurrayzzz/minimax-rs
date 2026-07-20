@@ -15,6 +15,7 @@ use candle_core::{D, Device, Tensor, quantized::gguf_file};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::VecDeque,
     convert::Infallible,
     path::{Path, PathBuf},
     sync::Arc,
@@ -46,6 +47,7 @@ struct AppState {
 const DEFAULT_PREFILL_CHUNK: usize = 512;
 const DEFAULT_MAX_TOKENS: usize = 131_072;
 const MAX_CONTEXT: usize = 196_608;
+const MAX_STOP_SEQUENCES: usize = 4;
 
 fn prefill_chunk() -> usize {
     static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -96,9 +98,226 @@ fn cache_reuse(prompt: &[u32], cached: &[u32], has_next_logits: bool) -> CacheRe
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeneratedDelta {
+    /// `None` marks text cut from inside a token. In particular, a partial
+    /// protocol-marker token must not be interpreted as the complete marker.
+    token: Option<u32>,
+    text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StopMatch {
+    deltas: Vec<GeneratedDelta>,
+    matched: bool,
+}
+
+struct StopPattern {
+    bytes: Vec<u8>,
+    failure: Vec<usize>,
+    matched: usize,
+}
+
+impl StopPattern {
+    fn new(stop: String) -> Self {
+        let bytes = stop.into_bytes();
+        let mut failure = vec![0; bytes.len()];
+        let mut prefix = 0;
+        for index in 1..bytes.len() {
+            while prefix > 0 && bytes[index] != bytes[prefix] {
+                prefix = failure[prefix - 1];
+            }
+            if bytes[index] == bytes[prefix] {
+                prefix += 1;
+            }
+            failure[index] = prefix;
+        }
+        Self {
+            bytes,
+            failure,
+            matched: 0,
+        }
+    }
+
+    fn advance(&mut self, byte: u8) -> bool {
+        while self.matched > 0 && byte != self.bytes[self.matched] {
+            self.matched = self.failure[self.matched - 1];
+        }
+        if byte == self.bytes[self.matched] {
+            self.matched += 1;
+        }
+        if self.matched == self.bytes.len() {
+            self.matched = self.failure[self.matched - 1];
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Incrementally withhold only the suffix that could still become a stop
+/// sequence. KMP state makes matching linear in newly decoded text rather than
+/// rescanning every user-supplied stop on every generated token.
+struct StopMatcher {
+    patterns: Vec<StopPattern>,
+    pending: VecDeque<GeneratedDelta>,
+    processed_bytes: usize,
+    pending_start: usize,
+}
+
+impl StopMatcher {
+    fn new(stops: &[String]) -> Self {
+        let mut stops = stops
+            .iter()
+            .filter(|stop| !stop.is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        stops.sort();
+        stops.dedup();
+        Self {
+            patterns: stops.into_iter().map(StopPattern::new).collect(),
+            pending: VecDeque::new(),
+            processed_bytes: 0,
+            pending_start: 0,
+        }
+    }
+
+    fn push(&mut self, token: Option<u32>, text: String) -> StopMatch {
+        if self.patterns.is_empty() {
+            self.processed_bytes += text.len();
+            self.pending_start = self.processed_bytes;
+            return StopMatch {
+                deltas: vec![GeneratedDelta { token, text }],
+                matched: false,
+            };
+        }
+
+        let chunk_start = self.processed_bytes;
+        self.pending.push_back(GeneratedDelta { token, text });
+        let mut stop_start = None;
+        for (index, byte) in self
+            .pending
+            .back()
+            .expect("just appended decoded text")
+            .text
+            .bytes()
+            .enumerate()
+        {
+            for pattern in &mut self.patterns {
+                let pattern_len = pattern.bytes.len();
+                if pattern.advance(byte) {
+                    let start = chunk_start + index + 1 - pattern_len;
+                    stop_start =
+                        Some(stop_start.map_or(start, |current: usize| current.min(start)));
+                }
+            }
+        }
+        self.processed_bytes += self
+            .pending
+            .back()
+            .expect("just appended decoded text")
+            .text
+            .len();
+
+        if let Some(stop_start) = stop_start {
+            let stop_pos = stop_start
+                .checked_sub(self.pending_start)
+                .expect("stop prefix is retained in pending text");
+            let deltas = self.take_match_prefix(stop_pos);
+            self.pending.clear();
+            self.pending_start = self.processed_bytes;
+            return StopMatch {
+                deltas,
+                matched: true,
+            };
+        }
+
+        let withheld = self
+            .patterns
+            .iter()
+            .map(|pattern| pattern.matched)
+            .max()
+            .unwrap_or(0);
+        let safe_bytes = self.processed_bytes - withheld - self.pending_start;
+        let deltas = self.take_whole_prefix(safe_bytes);
+        StopMatch {
+            deltas,
+            matched: false,
+        }
+    }
+
+    fn processed_bytes(&self) -> usize {
+        self.processed_bytes
+    }
+
+    fn finish(&mut self) -> StopMatch {
+        self.pending_start = self.processed_bytes;
+        StopMatch {
+            deltas: self.pending.drain(..).collect(),
+            matched: false,
+        }
+    }
+
+    /// Release only complete token events while a possible stop remains. This
+    /// prevents a protocol marker ID from being observed more than once.
+    fn take_whole_prefix(&mut self, mut bytes: usize) -> Vec<GeneratedDelta> {
+        let mut deltas = Vec::new();
+        while let Some(delta) = self.pending.front() {
+            if !delta.text.is_empty() && delta.text.len() > bytes {
+                break;
+            }
+            let delta = self.pending.pop_front().expect("front exists");
+            bytes -= delta.text.len();
+            self.pending_start += delta.text.len();
+            deltas.push(delta);
+        }
+        deltas
+    }
+
+    /// Once a stop has fully matched, text before it may end inside a token.
+    /// Emit that fragment as plain text without the token's semantic marker ID.
+    fn take_match_prefix(&mut self, mut bytes: usize) -> Vec<GeneratedDelta> {
+        let mut deltas = Vec::new();
+        while let Some(delta) = self.pending.front() {
+            if delta.text.is_empty() || delta.text.len() <= bytes {
+                let delta = self.pending.pop_front().expect("front exists");
+                bytes -= delta.text.len();
+                self.pending_start += delta.text.len();
+                deltas.push(delta);
+                continue;
+            }
+            if bytes > 0 {
+                debug_assert!(delta.text.is_char_boundary(bytes));
+                deltas.push(GeneratedDelta {
+                    token: None,
+                    text: delta.text[..bytes].to_owned(),
+                });
+                self.pending_start += bytes;
+                bytes = 0;
+            }
+            break;
+        }
+        debug_assert_eq!(bytes, 0);
+        deltas
+    }
+}
+
+fn truncate_at_stop(mut text: String, stops: &[String]) -> String {
+    if let Some(position) = stops
+        .iter()
+        .filter(|stop| !stop.is_empty())
+        .filter_map(|stop| text.find(stop))
+        .min()
+    {
+        text.truncate(position);
+    }
+    text
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GenerationFinish {
-    Eos,
+    Eog,
+    StopSequence,
     Length,
     Cancelled,
 }
@@ -106,7 +325,7 @@ enum GenerationFinish {
 impl GenerationFinish {
     fn openai_reason(self) -> &'static str {
         match self {
-            Self::Eos | Self::Cancelled => "stop",
+            Self::Eog | Self::StopSequence | Self::Cancelled => "stop",
             Self::Length => "length",
         }
     }
@@ -246,19 +465,21 @@ impl Engine {
         }
     }
 
-    /// Generate tokens while invoking `on_token` immediately after selecting
-    /// each token and before evaluating the next one. Returning false cancels
-    /// generation (normally because the streaming client disconnected).
+    /// Generate tokens while invoking `on_deltas` once after every selected
+    /// non-EOG token, even when a possible stop prefix leaves no text safe to
+    /// emit. Returning false cancels generation (normally because the
+    /// streaming client disconnected).
     fn generate_with<F>(
         &self,
         request_id: &str,
         prompt: &[u32],
         max_tokens: usize,
         _temperature: f32,
-        mut on_token: F,
+        stop_sequences: &[String],
+        mut on_deltas: F,
     ) -> Result<GenerationResult>
     where
-        F: FnMut(u32, String) -> bool,
+        F: FnMut(Vec<GeneratedDelta>) -> bool,
     {
         if prompt.is_empty() {
             bail!("prompt must contain at least one token id")
@@ -333,6 +554,7 @@ impl Engine {
         let decode_started = Instant::now();
         let mut generated = Vec::new();
         let mut decode_state = tokenizer::DecodeState::default();
+        let mut stop_matcher = StopMatcher::new(stop_sequences);
         let mut finish = GenerationFinish::Length;
         let mut logits_pending = false;
         for _ in 0..max_tokens {
@@ -340,8 +562,10 @@ impl Engine {
             // PCIe and scanning it on the CPU costs roughly 0.35 ms/token.
             let id = next.argmax(D::Minus1)?.to_scalar::<u32>()?;
             logits_pending = false;
-            if id == self.tokenizer.eos {
-                finish = GenerationFinish::Eos;
+            if self.tokenizer.is_eog(id) {
+                // The EOG token was selected but not evaluated, so neither the
+                // model KV cache nor cached_ids includes it.
+                finish = GenerationFinish::Eog;
                 break;
             }
             generated.push(id);
@@ -352,8 +576,16 @@ impl Engine {
                 .tokenizer
                 .decode_step(&mut decode_state, id)?
                 .unwrap_or_default();
-            if !on_token(id, delta) {
+            let stop_match = stop_matcher.push(Some(id), delta);
+            if !on_deltas(stop_match.deltas) {
                 finish = GenerationFinish::Cancelled;
+                break;
+            }
+            if stop_match.matched {
+                // Do not evaluate the token that completed the stop. Earlier
+                // buffered-prefix tokens were evaluated normally; cached_ids
+                // therefore remains an exact description of the model cache.
+                finish = GenerationFinish::StopSequence;
                 break;
             }
 
@@ -362,6 +594,33 @@ impl Engine {
             logits_pending = true;
             state.cached_ids.push(id);
             state.next_logits = Some(next.clone());
+        }
+        let decoded = self.tokenizer.decode(&generated)?;
+        if !matches!(
+            finish,
+            GenerationFinish::StopSequence | GenerationFinish::Cancelled
+        ) {
+            // DecodeStream deliberately withholds a trailing replacement
+            // character until more byte tokens arrive. Reconcile that final
+            // suffix so streaming and complete responses apply the same stop.
+            let decoded_tail = decoded
+                .get(stop_matcher.processed_bytes()..)
+                .context("streamed tokenizer output is not a decoded-text prefix")?;
+            if !decoded_tail.is_empty() {
+                let tail_match = stop_matcher.push(None, decoded_tail.to_owned());
+                if !on_deltas(tail_match.deltas) {
+                    finish = GenerationFinish::Cancelled;
+                } else if tail_match.matched {
+                    finish = GenerationFinish::StopSequence;
+                }
+            }
+        }
+        if !matches!(
+            finish,
+            GenerationFinish::StopSequence | GenerationFinish::Cancelled
+        ) && !on_deltas(stop_matcher.finish().deltas)
+        {
+            finish = GenerationFinish::Cancelled;
         }
         // Usually the following iteration's scalar argmax synchronizes each
         // decode step. A length-limited request leaves its last logits pending,
@@ -373,7 +632,7 @@ impl Engine {
         let decode_time = decode_started.elapsed();
 
         let result = GenerationResult {
-            text: self.tokenizer.decode(&generated)?,
+            text: truncate_at_stop(decoded, stop_sequences),
             token_count: generated.len(),
             finish,
             cached_prompt_tokens,
@@ -391,6 +650,33 @@ impl Engine {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum StopSequences {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl StopSequences {
+    fn into_vec(self) -> Result<Vec<String>> {
+        let stops = match self {
+            Self::One(stop) => vec![stop],
+            Self::Many(stops) => stops,
+        };
+        if stops.len() > MAX_STOP_SEQUENCES {
+            bail!("stop supports at most {MAX_STOP_SEQUENCES} sequences")
+        }
+        Ok(stops)
+    }
+}
+
+fn normalize_stop_sequences(stop: Option<StopSequences>) -> Result<Vec<String>> {
+    Ok(stop
+        .map(StopSequences::into_vec)
+        .transpose()?
+        .unwrap_or_default())
+}
+
 #[derive(Deserialize)]
 struct CompletionRequest {
     model: Option<String>,
@@ -401,6 +687,8 @@ struct CompletionRequest {
     temperature: f32,
     #[serde(default)]
     stream: bool,
+    #[serde(default)]
+    stop: Option<StopSequences>,
 }
 fn default_temperature() -> f32 {
     1.0
@@ -430,6 +718,8 @@ struct ChatRequest {
     tools: Vec<serde_json::Value>,
     #[serde(default)]
     tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    stop: Option<StopSequences>,
 }
 
 impl ChatRequest {
@@ -565,6 +855,10 @@ async fn completions(
     State(state): State<AppState>,
     Json(req): Json<CompletionRequest>,
 ) -> axum::response::Response {
+    let stop_sequences = match normalize_stop_sequences(req.stop) {
+        Ok(stops) => stops,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
     let prompts = match req.prompt {
         Prompt::Text(text) => match state.engine.tokenizer.encode(&text) {
             Ok(ids) => vec![ids],
@@ -610,23 +904,33 @@ async fn completions(
                 &prompt,
                 max_tokens,
                 temperature,
-                move |_token, text| {
-                    text.is_empty()
-                        || send_sse(
-                            &token_sender,
-                            serde_json::json!({
-                                "id": stream_id,
-                                "object": "text_completion",
-                                "created": created,
-                                "model": stream_model,
-                                "choices": [{
-                                    "text": text,
-                                    "index": 0,
-                                    "logprobs": null,
-                                    "finish_reason": null
-                                }]
-                            }),
-                        )
+                &stop_sequences,
+                move |deltas| {
+                    if token_sender.is_closed() {
+                        return false;
+                    }
+                    for delta in deltas {
+                        if !delta.text.is_empty()
+                            && !send_sse(
+                                &token_sender,
+                                serde_json::json!({
+                                    "id": stream_id,
+                                    "object": "text_completion",
+                                    "created": created,
+                                    "model": stream_model,
+                                    "choices": [{
+                                        "text": delta.text,
+                                        "index": 0,
+                                        "logprobs": null,
+                                        "finish_reason": null
+                                    }]
+                                }),
+                            )
+                        {
+                            return false;
+                        }
+                    }
+                    true
                 },
             );
             match generation {
@@ -666,7 +970,8 @@ async fn completions(
             &prompt,
             max_tokens,
             temperature,
-            |_token, _text| true,
+            &stop_sequences,
+            |_deltas| true,
         )
     })
     .await
@@ -700,6 +1005,10 @@ async fn chat_completions(
         return api_error(StatusCode::BAD_REQUEST, "messages must not be empty");
     }
     let max_tokens = req.output_limit();
+    let stop_sequences = match normalize_stop_sequences(req.stop) {
+        Ok(stops) => stops,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
     let tools = if req
         .tool_choice
         .as_ref()
@@ -755,52 +1064,67 @@ async fn chat_completions(
             let mut parser = chat::ChatStreamParser::new(markers, tool_registry.clone());
             let mut streamed_tool_calls = false;
             let token_sender = sender.clone();
-            let generation =
-                engine.generate_with(&id, &ids, max_tokens, temperature, |token, text| {
-                    for delta in parser.push(token, text) {
-                        let delta = match delta {
-                            chat::StreamDelta::Reasoning(reasoning) => {
-                                serde_json::json!({"reasoning_content": reasoning})
-                            }
-                            chat::StreamDelta::Content(content) => {
-                                serde_json::json!({"content": content})
-                            }
-                            chat::StreamDelta::ToolCalls(calls) => {
-                                streamed_tool_calls = true;
-                                let calls = calls
-                                    .into_iter()
-                                    .enumerate()
-                                    .map(|(index, call)| {
-                                        serde_json::json!({
-                                            "index": index,
-                                            "id": call.id,
-                                            "type": call.r#type,
-                                            "function": call.function
-                                        })
-                                    })
-                                    .collect::<Vec<_>>();
-                                serde_json::json!({"tool_calls": calls})
-                            }
+            let generation = engine.generate_with(
+                &id,
+                &ids,
+                max_tokens,
+                temperature,
+                &stop_sequences,
+                |deltas| {
+                    if token_sender.is_closed() {
+                        return false;
+                    }
+                    for generated in deltas {
+                        let parsed_deltas = match generated.token {
+                            Some(token) => parser.push(token, generated.text),
+                            None => parser.push_text(generated.text),
                         };
-                        if !send_sse(
-                            &token_sender,
-                            serde_json::json!({
-                                "id": stream_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": stream_model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": delta,
-                                    "finish_reason": null
-                                }]
-                            }),
-                        ) {
-                            return false;
+                        for delta in parsed_deltas {
+                            let delta = match delta {
+                                chat::StreamDelta::Reasoning(reasoning) => {
+                                    serde_json::json!({"reasoning_content": reasoning})
+                                }
+                                chat::StreamDelta::Content(content) => {
+                                    serde_json::json!({"content": content})
+                                }
+                                chat::StreamDelta::ToolCalls(calls) => {
+                                    streamed_tool_calls = true;
+                                    let calls = calls
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(index, call)| {
+                                            serde_json::json!({
+                                                "index": index,
+                                                "id": call.id,
+                                                "type": call.r#type,
+                                                "function": call.function
+                                            })
+                                        })
+                                        .collect::<Vec<_>>();
+                                    serde_json::json!({"tool_calls": calls})
+                                }
+                            };
+                            if !send_sse(
+                                &token_sender,
+                                serde_json::json!({
+                                    "id": stream_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": stream_model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": delta,
+                                        "finish_reason": null
+                                    }]
+                                }),
+                            ) {
+                                return false;
+                            }
                         }
                     }
                     true
-                });
+                },
+            );
             match generation {
                 Ok(generation) => {
                     for delta in parser.finish() {
@@ -891,7 +1215,8 @@ async fn chat_completions(
             &ids,
             max_tokens,
             temperature,
-            |_token, _text| true,
+            &stop_sequences,
+            |_deltas| true,
         )
     })
     .await
@@ -1053,6 +1378,192 @@ mod tests {
     }
 
     #[test]
+    fn completion_and_chat_stop_deserialization_supports_openai_shapes() {
+        let completion = serde_json::from_value::<CompletionRequest>(json!({
+            "prompt": "hello",
+            "stop": "END"
+        }))
+        .expect("completion string stop");
+        assert_eq!(
+            completion
+                .stop
+                .expect("stop")
+                .into_vec()
+                .expect("valid stop"),
+            vec!["END".to_owned()]
+        );
+
+        let completion_array = serde_json::from_value::<CompletionRequest>(json!({
+            "prompt": "hello",
+            "stop": ["END", "DONE"]
+        }))
+        .expect("completion stop array");
+        assert_eq!(
+            completion_array
+                .stop
+                .expect("stop")
+                .into_vec()
+                .expect("valid stops"),
+            vec!["END".to_owned(), "DONE".to_owned()]
+        );
+
+        let chat = serde_json::from_value::<ChatRequest>(json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "stop": ["END", "DONE"]
+        }))
+        .expect("chat stop array");
+        assert_eq!(
+            chat.stop.expect("stop").into_vec().expect("valid stops"),
+            vec!["END".to_owned(), "DONE".to_owned()]
+        );
+        let chat_string = serde_json::from_value::<ChatRequest>(json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "stop": "END"
+        }))
+        .expect("chat string stop");
+        assert_eq!(
+            chat_string
+                .stop
+                .expect("stop")
+                .into_vec()
+                .expect("valid stop"),
+            vec!["END".to_owned()]
+        );
+
+        let nullable = serde_json::from_value::<CompletionRequest>(json!({
+            "prompt": "hello",
+            "stop": null
+        }))
+        .expect("nullable stop");
+        assert!(nullable.stop.is_none());
+        assert!(
+            serde_json::from_value::<CompletionRequest>(json!({
+                "prompt": "hello",
+                "stop": ["END", 7]
+            }))
+            .is_err()
+        );
+        assert!(
+            normalize_stop_sequences(Some(StopSequences::Many(
+                ["one", "two", "three", "four", "five"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            )))
+            .is_err()
+        );
+    }
+
+    fn delta_pairs(result: &StopMatch) -> Vec<(Option<u32>, &str)> {
+        result
+            .deltas
+            .iter()
+            .map(|delta| (delta.token, delta.text.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn stop_matcher_withholds_cross_token_matches_and_stop_text() {
+        let mut matcher = StopMatcher::new(&["STOP".to_owned(), "END".to_owned()]);
+
+        let first = matcher.push(Some(7), "alpha ST".to_owned());
+        assert!(!first.matched);
+        assert!(first.deltas.is_empty());
+
+        let second = matcher.push(Some(8), "OP ignored".to_owned());
+        assert!(second.matched);
+        assert_eq!(delta_pairs(&second), vec![(None, "alpha ")]);
+    }
+
+    #[test]
+    fn stop_matcher_releases_false_prefixes_with_original_token_ids() {
+        let mut matcher = StopMatcher::new(&["END".to_owned()]);
+
+        let first = matcher.push(Some(11), "value EN".to_owned());
+        assert!(first.deltas.is_empty());
+
+        let second = matcher.push(Some(12), "core".to_owned());
+        assert!(!second.matched);
+        assert_eq!(
+            delta_pairs(&second),
+            vec![(Some(11), "value EN"), (Some(12), "core")]
+        );
+
+        let third = matcher.push(Some(13), " trailing EN".to_owned());
+        assert!(third.deltas.is_empty());
+        let trailing = matcher.finish();
+        assert_eq!(delta_pairs(&trailing), vec![(Some(13), " trailing EN")]);
+    }
+
+    #[test]
+    fn stop_matcher_chooses_the_earliest_overlapping_stop() {
+        let mut matcher = StopMatcher::new(&["bc".to_owned(), "abc".to_owned()]);
+        let matched = matcher.push(Some(3), "zabc trailing".to_owned());
+
+        assert!(matched.matched);
+        assert_eq!(delta_pairs(&matched), vec![(None, "z")]);
+    }
+
+    #[test]
+    fn stop_matcher_never_reuses_marker_ids_for_partial_text() {
+        let marker = "<minimax:tool_call>";
+        let mut matched = StopMatcher::new(&["tool_call>".to_owned()]);
+        let result = matched.push(Some(12), marker.to_owned());
+        assert!(result.matched);
+        assert_eq!(delta_pairs(&result), vec![(None, "<minimax:")]);
+
+        let mut false_prefix = StopMatcher::new(&["tool_call>X".to_owned()]);
+        assert!(
+            false_prefix
+                .push(Some(12), marker.to_owned())
+                .deltas
+                .is_empty()
+        );
+        let released = false_prefix.push(Some(99), "Y".to_owned());
+        assert!(!released.matched);
+        assert_eq!(
+            delta_pairs(&released),
+            vec![(Some(12), marker), (Some(99), "Y")]
+        );
+    }
+
+    #[test]
+    fn final_decoder_tail_can_complete_a_stop() {
+        let mut matcher = StopMatcher::new(&["abc�".to_owned()]);
+        let first = matcher.push(Some(1), "before abc".to_owned());
+        assert!(first.deltas.is_empty());
+        assert_eq!(matcher.processed_bytes(), "before abc".len());
+
+        let tail = matcher.push(None, "�".to_owned());
+        assert!(tail.matched);
+        assert_eq!(delta_pairs(&tail), vec![(None, "before ")]);
+    }
+
+    #[test]
+    fn streaming_stop_output_matches_non_stream_truncation() {
+        let stops = vec!["終わり".to_owned(), String::new()];
+        let chunks = [(1, "before 終"), (2, "わ"), (3, "り after")];
+        let mut matcher = StopMatcher::new(&stops);
+        let mut streamed = String::new();
+        for (token, text) in chunks {
+            let result = matcher.push(Some(token), text.to_owned());
+            for delta in result.deltas {
+                streamed.push_str(&delta.text);
+            }
+            if result.matched {
+                break;
+            }
+        }
+
+        assert_eq!(streamed, "before ");
+        assert_eq!(
+            streamed,
+            truncate_at_stop("before 終わり after".to_owned(), &stops)
+        );
+        assert_eq!(truncate_at_stop("no match".to_owned(), &stops), "no match");
+    }
+
+    #[test]
     fn chat_output_limit_honors_openai_alias_precedence() {
         let request = |limits: serde_json::Value| {
             let mut value = json!({"messages": [{"role": "user", "content": "hello"}]});
@@ -1098,7 +1609,11 @@ mod tests {
         assert_eq!(finish_reason(&generation, false), "length");
         assert_eq!(finish_reason(&generation, true), "tool_calls");
 
-        for finish in [GenerationFinish::Eos, GenerationFinish::Cancelled] {
+        for finish in [
+            GenerationFinish::Eog,
+            GenerationFinish::StopSequence,
+            GenerationFinish::Cancelled,
+        ] {
             let generation = GenerationResult {
                 text: String::new(),
                 token_count: 0,

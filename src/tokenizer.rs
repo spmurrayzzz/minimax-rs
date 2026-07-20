@@ -19,6 +19,52 @@ use tokenizers::{
 // by llama.cpp and the original tokenizer.json.
 const MINIMAX_PRETOKENIZER_REGEX: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+// llama.cpp promotes these recognized token spellings to end-of-generation in
+// addition to the GGUF's explicitly configured EOS/EOT/EOM and FIM IDs. The
+// MiniMax vocabulary uses <fim_pad>, <reponame>, and [e~[ (configured EOS).
+const LLAMA_EOG_TOKEN_TEXTS: &[&str] = &[
+    "<|fim_pad|>",
+    "<fim-pad>",
+    "<fim_pad>",
+    "<PAD>",
+    "[PAD]",
+    "<|fim_repo|>",
+    "<|repo_name|>",
+    "<fim-repo>",
+    "<REPO>",
+    "<reponame>",
+    "<|file_sep|>",
+    "<|eot_id|>",
+    "<|im_end|>",
+    "<|end|>",
+    "<|return|>",
+    "<|call|>",
+    "<|flush|>",
+    "<|calls|>",
+    "<end_of_turn>",
+    "<|endoftext|>",
+    "</s>",
+    "<|eom_id|>",
+    "<EOT>",
+    "_<EOT>",
+    "[EOT]",
+    "[EOS]",
+    "<|end_of_text|>",
+    "<end_of_utterance>",
+    "<eos>",
+    "<turn|>",
+    "<|tool_response>",
+    "<｜end▁of▁sentence｜>",
+];
+
+const CONFIGURED_EOG_METADATA: &[&str] = &[
+    "tokenizer.ggml.eot_token_id",
+    "tokenizer.ggml.eom_token_id",
+    "tokenizer.ggml.fim_pad_token_id",
+    "tokenizer.ggml.fim_rep_token_id",
+    "tokenizer.ggml.fim_sep_token_id",
+];
+
 #[derive(Default)]
 pub struct DecodeState {
     ids: Vec<u32>,
@@ -28,7 +74,7 @@ pub struct DecodeState {
 
 pub struct MiniMaxTokenizer {
     inner: Tokenizer,
-    pub eos: u32,
+    eog_ids: Vec<u32>,
     pub think_start: u32,
     pub think_end: u32,
     pub tool_start: u32,
@@ -66,6 +112,29 @@ impl MiniMaxTokenizer {
         };
         let tokens = strings("tokenizer.ggml.tokens")?;
         let merges = strings("tokenizer.ggml.merges")?;
+        let eos = content
+            .metadata
+            .get("tokenizer.ggml.eos_token_id")
+            .context("missing eos")?
+            .to_u32()?;
+        let mut eog_ids = vec![eos];
+        eog_ids.extend(
+            CONFIGURED_EOG_METADATA
+                .iter()
+                .filter_map(|name| content.metadata.get(*name))
+                .map(|value| value.to_u32())
+                .collect::<candle_core::Result<Vec<_>>>()?,
+        );
+        eog_ids.extend(
+            tokens
+                .iter()
+                .enumerate()
+                .filter(|(_, token)| LLAMA_EOG_TOKEN_TEXTS.contains(&token.as_str()))
+                .map(|(id, _)| id as u32),
+        );
+        eog_ids.sort_unstable();
+        eog_ids.dedup();
+
         let vocab: AHashMap<_, _> = tokens
             .into_iter()
             .enumerate()
@@ -113,13 +182,8 @@ impl MiniMaxTokenizer {
                 .token_to_id(token)
                 .with_context(|| format!("missing tokenizer token {token}"))
         };
-        let eos = content
-            .metadata
-            .get("tokenizer.ggml.eos_token_id")
-            .context("missing eos")?
-            .to_u32()?;
         Ok(Self {
-            eos,
+            eog_ids,
             think_start: token_id("<think>")?,
             think_end: token_id("</think>")?,
             tool_start: token_id("<minimax:tool_call>")?,
@@ -139,6 +203,15 @@ impl MiniMaxTokenizer {
         self.inner
             .decode(ids, true)
             .map_err(|e| anyhow::anyhow!("decode failed: {e}"))
+    }
+
+    pub fn is_eog(&self, id: u32) -> bool {
+        self.eog_ids.binary_search(&id).is_ok()
+    }
+
+    #[cfg(test)]
+    fn eog_ids(&self) -> &[u32] {
+        &self.eog_ids
     }
 
     pub fn decode_step(&self, state: &mut DecodeState, id: u32) -> Result<Option<String>> {
@@ -202,6 +275,11 @@ mod tests {
         assert_eq!(t.think_end, 200051);
         assert_eq!(t.tool_start, 200052);
         assert_eq!(t.tool_end, 200053);
+        assert_eq!(t.eog_ids(), &[200004, 200005, 200020]);
+        for id in [200004, 200005, 200020] {
+            assert!(t.is_eog(id), "expected token {id} to be EOG");
+        }
+        assert!(!t.is_eog(200019));
         assert_eq!(
             t.decode(&[t.think_end, t.tool_start, t.tool_end]).unwrap(),
             "</think><minimax:tool_call></minimax:tool_call>"

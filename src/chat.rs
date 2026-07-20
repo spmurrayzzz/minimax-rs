@@ -727,6 +727,13 @@ impl ChatStreamParser {
                 vec![StreamDelta::ToolCalls(calls)]
             };
         }
+        self.push_text(text)
+    }
+
+    /// Route decoded text that no longer represents a complete source token.
+    /// Stop matching can cut through a protocol marker, in which case the
+    /// surviving prefix must remain ordinary text rather than trigger it.
+    pub fn push_text(&mut self, text: String) -> Vec<StreamDelta> {
         if text.is_empty() {
             return Vec::new();
         }
@@ -1262,6 +1269,16 @@ mod tests {
         assert!(matches!(
             parser.push(99, "after".into()).as_slice(),
             [StreamDelta::Content(text)] if text == "after"
+        ));
+        assert!(parser.finish().is_empty());
+    }
+
+    #[test]
+    fn stream_parser_treats_partial_marker_tokens_as_plain_text() {
+        let mut parser = ChatStreamParser::new(markers(), registry(&[]));
+        assert!(matches!(
+            parser.push_text("<minimax:".to_owned()).as_slice(),
+            [StreamDelta::Reasoning(text)] if text == "<minimax:"
         ));
         assert!(parser.finish().is_empty());
     }
