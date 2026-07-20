@@ -141,16 +141,19 @@ impl Attention {
             // 48-by-context score allocation that dominated long-context decode.
             candle_nn::fused_attention::gqa_decode_f16_128(&q, &k, &v, 1.0 / (HD as f32).sqrt())?
         } else {
-            // Prefill applies the causal boundary inside the split-K online
-            // softmax kernel. Its workspace is bounded by the query chunk and
-            // split count instead of materializing Q-by-context scores.
-            candle_nn::fused_attention::gqa_prefill_f16_128(
-                &q,
-                &k,
-                &v,
-                pos,
+            // FlashAttention tiles both query and KV positions through shared
+            // memory and uses tensor cores. The previous one-query-per-block
+            // split-K kernel became the dominant cost as cached context grew.
+            // Transposes are strided views, so this reads the preallocated cache
+            // directly without copying or materializing Q-by-context scores.
+            candle_flash_attn::flash_attn(
+                &q.transpose(1, 2)?,
+                &k.transpose(1, 2)?,
+                &v.transpose(1, 2)?,
                 1.0 / (HD as f32).sqrt(),
+                true,
             )?
+            .transpose(1, 2)?
         };
         self.o
             .forward(&y.transpose(1, 2)?.contiguous()?.reshape((1, l, QH * HD))?)

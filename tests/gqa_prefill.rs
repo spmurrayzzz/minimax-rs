@@ -37,6 +37,17 @@ fn grouped_causal_reference(
         .reshape((1, QUERY_HEADS, query_len, HEAD_DIM))
 }
 
+fn flash_prefill(q: &Tensor, k: &Tensor, v: &Tensor) -> candle_core::Result<Tensor> {
+    candle_flash_attn::flash_attn(
+        &q.transpose(1, 2)?,
+        &k.transpose(1, 2)?,
+        &v.transpose(1, 2)?,
+        1.0 / (HEAD_DIM as f32).sqrt(),
+        true,
+    )?
+    .transpose(1, 2)
+}
+
 fn random_cache(
     device: &Device,
     query_len: usize,
@@ -59,20 +70,14 @@ fn random_cache(
 
 #[test]
 #[ignore = "requires an sm_120 CUDA device"]
-fn fused_prefill_matches_grouped_causal_attention() -> Result<()> {
+fn flash_prefill_matches_grouped_causal_attention() -> Result<()> {
     let device = Device::new_cuda(0)?;
     unsafe { device.as_cuda_device()?.disable_event_tracking() };
 
     for (query_len, past_len) in [(2, 0), (5, 7), (39, 0), (512, 0), (17, 512)] {
         let (q, k, v) = random_cache(&device, query_len, past_len)?;
         let reference = grouped_causal_reference(&q, &k, &v, past_len)?;
-        let candidate = candle_nn::fused_attention::gqa_prefill_f16_128(
-            &q,
-            &k,
-            &v,
-            past_len,
-            1.0 / (HEAD_DIM as f32).sqrt(),
-        )?;
+        let candidate = flash_prefill(&q, &k, &v)?;
         let max_abs = (&reference - &candidate)?
             .abs()?
             .to_dtype(DType::F32)?
@@ -109,7 +114,7 @@ fn fused_prefill_matches_grouped_causal_attention() -> Result<()> {
 }
 
 #[test]
-fn near_limit_prefill_workspace_is_bounded() -> Result<()> {
+fn legacy_split_k_near_limit_workspace_is_bounded() -> Result<()> {
     let workspace = candle_nn::fused_attention::gqa_prefill_workspace_bytes(512, MAX_CONTEXT)?;
     assert_eq!(workspace, 159_645_696);
     assert!(workspace <= 192 * 1024 * 1024);
@@ -118,19 +123,13 @@ fn near_limit_prefill_workspace_is_bounded() -> Result<()> {
 
 #[test]
 #[ignore = "allocates a near-limit synthetic KV cache on CUDA"]
-fn fused_prefill_reaches_the_context_limit() -> Result<()> {
+fn flash_prefill_reaches_the_context_limit() -> Result<()> {
     let device = Device::new_cuda(0)?;
     unsafe { device.as_cuda_device()?.disable_event_tracking() };
     let q = Tensor::zeros((1, QUERY_HEADS, 512, HEAD_DIM), DType::F16, &device)?;
     let k = Tensor::zeros((1, KV_HEADS, MAX_CONTEXT, HEAD_DIM), DType::F16, &device)?;
     let v = Tensor::zeros((1, KV_HEADS, MAX_CONTEXT, HEAD_DIM), DType::F16, &device)?;
-    let output = candle_nn::fused_attention::gqa_prefill_f16_128(
-        &q,
-        &k,
-        &v,
-        MAX_CONTEXT - 512,
-        1.0 / (HEAD_DIM as f32).sqrt(),
-    )?;
+    let output = flash_prefill(&q, &k, &v)?;
     assert_eq!(output.dims4()?, (1, QUERY_HEADS, 512, HEAD_DIM));
     assert_eq!(
         output

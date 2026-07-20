@@ -34,6 +34,6 @@ Endpoints: `/health`, `/v1/models`, `/v1/completions`, and `/v1/chat/completions
 
 Chat completions support SSE streaming, `reasoning_content`, OpenAI function tools, MiniMax XML tool-call parsing, prior assistant/tool turns, and both `max_tokens` and `max_completion_tokens`. The default output limit is 131,072 tokens. Longest-common-token-prefix KV reuse accelerates subsequent agent/tool turns and is reported as `usage.prompt_tokens_details.cached_tokens`.
 
-The implementation defaults to 512-token parallel prefill chunks; `MINIMAX_PREFILL_CHUNK` can raise the physical chunk size to at most 2,048. Q4_K/Q5_K expert projections use direct quantized MMQ for prefill batches of at least 32 tokens, while shorter batches retain the lower-overhead generic kernel.
+The implementation defaults to 512-token parallel prefill chunks with CUDA FlashAttention over the retained KV prefix; `MINIMAX_PREFILL_CHUNK` can raise the physical chunk size to at most 2,048. Q4_K/Q5_K expert projections use direct quantized MMQ for prefill batches of at least 32 tokens, while shorter batches retain the lower-overhead generic kernel.
 
 Each completed request emits an info-level `inference timings` event with prompt/cache token counts, prefill and decode durations, milliseconds per token, tokens per second, total inference time, and finish reason. Prefill throughput counts only the uncached prompt suffix, so cache hits remain distinguishable from model evaluation.

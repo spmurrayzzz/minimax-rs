@@ -44,16 +44,60 @@ fn old_prefill(q: &Tensor, k: &Tensor, v: &Tensor) -> candle_core::Result<Tensor
         .reshape((1, QH, seq_len, HD))
 }
 
-fn grouped_prefill(q: &Tensor, k: &Tensor, v: &Tensor) -> candle_core::Result<Tensor> {
+fn grouped_prefill(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+) -> candle_core::Result<Tensor> {
     let (_, _, seq_len, _) = q.dims4()?;
     let kv_len = k.dim(2)?;
     let q = q.reshape((1, KVH, (QH / KVH) * seq_len, HD))?;
-    let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * (1.0 / (HD as f64).sqrt()))?
+    let mut scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * (1.0 / (HD as f64).sqrt()))?
         .reshape((1, KVH, QH / KVH, seq_len, kv_len))?;
+    if let Some(mask) = mask {
+        scores = scores.broadcast_add(mask)?;
+    }
     candle_nn::ops::softmax_last_dim(&scores)?
         .reshape((1, KVH, (QH / KVH) * seq_len, kv_len))?
         .matmul(v)?
         .reshape((1, QH, seq_len, HD))
+}
+
+fn fused_prefill(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    past_len: usize,
+) -> candle_core::Result<Tensor> {
+    candle_nn::fused_attention::gqa_prefill_f16_128(q, k, v, past_len, 1.0 / (HD as f32).sqrt())
+}
+
+fn flash_prefill(q: &Tensor, k: &Tensor, v: &Tensor) -> candle_core::Result<Tensor> {
+    candle_flash_attn::flash_attn(
+        &q.transpose(1, 2)?,
+        &k.transpose(1, 2)?,
+        &v.transpose(1, 2)?,
+        1.0 / (HD as f32).sqrt(),
+        true,
+    )?
+    .transpose(1, 2)
+}
+
+fn causal_mask(query_len: usize, past_len: usize, device: &Device) -> Result<Tensor> {
+    let kv_len = past_len + query_len;
+    let values = (0..query_len)
+        .flat_map(|query| {
+            (0..kv_len).map(move |key| {
+                if key <= past_len + query {
+                    0.0f32
+                } else {
+                    f32::NEG_INFINITY
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Tensor::from_vec(values, (1, 1, 1, query_len, kv_len), device)?.to_dtype(DType::F16)?)
 }
 
 fn elapsed_ms<F>(device: &Device, iterations: usize, mut f: F) -> Result<f64>
@@ -132,7 +176,7 @@ fn main() -> Result<()> {
         let k = Tensor::randn(0f32, 1f32, (1, KVH, seq_len, HD), &device)?.to_dtype(DType::F16)?;
         let v = Tensor::randn(0f32, 1f32, (1, KVH, seq_len, HD), &device)?.to_dtype(DType::F16)?;
         let reference = old_prefill(&q, &k, &v)?;
-        let candidate = grouped_prefill(&q, &k, &v)?;
+        let candidate = grouped_prefill(&q, &k, &v, None)?;
         device.synchronize()?;
         let max_abs = (&reference - &candidate)?
             .abs()?
@@ -140,10 +184,52 @@ fn main() -> Result<()> {
             .max_all()?
             .to_scalar::<f32>()?;
         let old_ms = elapsed_ms(&device, iterations, || old_prefill(&q, &k, &v))?;
-        let grouped_ms = elapsed_ms(&device, iterations, || grouped_prefill(&q, &k, &v))?;
+        let grouped_ms = elapsed_ms(&device, iterations, || grouped_prefill(&q, &k, &v, None))?;
         println!(
             "prefill tokens={seq_len:>3} repeat={old_ms:.4}ms grouped={grouped_ms:.4}ms speedup={:.2}x max_abs={max_abs:.9}",
             old_ms / grouped_ms
+        );
+    }
+    for (query_len, past_len, iterations) in [
+        (39usize, 0usize, 100usize),
+        (512, 0, 20),
+        (512, 1_536, 10),
+        (512, 8_192, 5),
+        (512, 16_384, 3),
+        (512, 24_576, 2),
+    ] {
+        let kv_len = past_len + query_len;
+        let capacity = kv_len.div_ceil(4096) * 4096;
+        let q = Tensor::randn(0f32, 1f32, (1, QH, query_len, HD), &device)?.to_dtype(DType::F16)?;
+        let k_backing =
+            Tensor::randn(0f32, 1f32, (1, KVH, capacity, HD), &device)?.to_dtype(DType::F16)?;
+        let v_backing =
+            Tensor::randn(0f32, 1f32, (1, KVH, capacity, HD), &device)?.to_dtype(DType::F16)?;
+        let k = k_backing.narrow(2, 0, kv_len)?;
+        let v = v_backing.narrow(2, 0, kv_len)?;
+        let mask = causal_mask(query_len, past_len, &device)?;
+        let reference = grouped_prefill(&q, &k, &v, Some(&mask))?;
+        let candidate = fused_prefill(&q, &k, &v, past_len)?;
+        let flash_candidate = flash_prefill(&q, &k, &v)?;
+        device.synchronize()?;
+        let max_abs = (&reference - &candidate)?
+            .abs()?
+            .to_dtype(DType::F32)?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        let flash_max_abs = (&reference - &flash_candidate)?
+            .abs()?
+            .to_dtype(DType::F32)?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        let grouped_ms = elapsed_ms(&device, iterations, || {
+            grouped_prefill(&q, &k, &v, Some(&mask))
+        })?;
+        let fused_ms = elapsed_ms(&device, iterations, || fused_prefill(&q, &k, &v, past_len))?;
+        let flash_ms = elapsed_ms(&device, iterations, || flash_prefill(&q, &k, &v))?;
+        println!(
+            "causal-prefill query={query_len:>3} past={past_len:>5} grouped={grouped_ms:.4}ms fused={fused_ms:.4}ms flash={flash_ms:.4}ms fused/flash={:.2}x max_abs={max_abs:.9} flash_abs={flash_max_abs:.9}",
+            fused_ms / flash_ms
         );
     }
     Ok(())

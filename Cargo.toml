@@ -13,6 +13,7 @@ ahash = "0.8"
 anyhow = "1"
 axum = "0.8"
 candle-core = { version = "0.11", features = ["cuda"] }
+candle-flash-attn = "0.11"
 candle-nn = { version = "0.11", features = ["cuda"] }
 candle-transformers = { version = "0.11", features = ["cuda"] }
 clap = { version = "4", features = ["derive", "env"] }
