@@ -43,9 +43,22 @@ struct AppState {
     engine: Arc<Engine>,
 }
 
-const PREFILL_CHUNK: usize = 512;
+const DEFAULT_PREFILL_CHUNK: usize = 512;
 const DEFAULT_MAX_TOKENS: usize = 131_072;
 const MAX_CONTEXT: usize = 196_608;
+
+fn prefill_chunk() -> usize {
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MINIMAX_PREFILL_CHUNK")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            // 2048 matches llama.cpp's logical batch default and is the
+            // largest physical batch validated across attention and MoE.
+            .filter(|&value| (1..=2048).contains(&value))
+            .unwrap_or(DEFAULT_PREFILL_CHUNK)
+    })
+}
 
 struct ModelState {
     model: model::Model,
@@ -301,7 +314,7 @@ impl Engine {
         } else {
             None
         };
-        for chunk in prompt[state.cached_ids.len()..].chunks(PREFILL_CHUNK) {
+        for chunk in prompt[state.cached_ids.len()..].chunks(prefill_chunk()) {
             let offset = state.cached_ids.len();
             next = Some(state.model.forward(chunk, offset)?);
             state.cached_ids.extend_from_slice(chunk);
@@ -940,7 +953,7 @@ async fn main() -> Result<()> {
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(AppState { engine });
     let listener = TcpListener::bind(&args.host).await?;
-    info!(address = %args.host, "MiniMax server listening");
+    info!(address = %args.host, prefill_chunk = prefill_chunk(), "MiniMax server listening");
     axum::serve(listener, app).await?;
     Ok(())
 }

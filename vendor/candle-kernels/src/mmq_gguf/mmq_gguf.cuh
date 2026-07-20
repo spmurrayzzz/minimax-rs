@@ -3610,7 +3610,8 @@ static __global__ void mul_mat_q(
                     break;
                 }
 
-                ids_dst_shared[j] = ids_dst[col_low + jt*mmq_x + j];
+                const int id_index = col_low + jt*mmq_x + j;
+                ids_dst_shared[j] = id_index < col_high ? ids_dst[id_index] : 0;
             }
             __syncthreads();
         }
@@ -3690,7 +3691,8 @@ static __global__ void mul_mat_q(
                     break;
                 }
 
-                ids_dst_shared[j] = ids_dst[col_low + jt*mmq_x + j];
+                const int id_index = col_low + jt*mmq_x + j;
+                ids_dst_shared[j] = id_index < col_high ? ids_dst[id_index] : 0;
             }
             __syncthreads();
         }
@@ -3907,7 +3909,8 @@ static __global__ void mul_mat_q_stream_k_fixup(const int32_t * ids_dst,
     const int col_diff = col_high - col_low;
 
     for (int j = threadIdx.y*warp_size + threadIdx.x; j < mmq_x; j += nwarps*warp_size) {
-        ids_dst_shared[j] = ids_dst[col_low + jt*mmq_x + j];
+        const int id_index = col_low + jt*mmq_x + j;
+        ids_dst_shared[j] = id_index < col_high ? ids_dst[id_index] : 0;
     }
     __syncthreads();
 

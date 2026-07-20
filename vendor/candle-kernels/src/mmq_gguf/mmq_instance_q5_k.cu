@@ -134,3 +134,24 @@ extern "C" void launch_mmq_gguf_q5_k(
 
     launch_mmq_case_q5_k((float *)tmp_fixup_ptr, args, (cudaStream_t)stream, cc, nsm, smpbo, warp_size_host);
 }
+
+extern "C" void launch_mmq_gguf_q5_k_moe(
+    void *tmp_fixup_ptr,
+    const void *x, const void *y_q8_1_mmq, const int32_t *ids_dst,
+    const int32_t *expert_bounds, void *dst,
+    int64_t ncols_x, int64_t nrows_x, int64_t ncols_y,
+    int64_t stride_row_x, int64_t stride_col_dst,
+    int num_experts, int64_t ncols_max, int use_stream_k,
+    int cc, int nsm, int64_t smpbo, int warp_size_host,
+    void *stream) {
+
+    const mmq_args args = {
+        (const char *)x, GGML_TYPE_Q5_K, (const int *)y_q8_1_mmq, ids_dst, expert_bounds, (float *)dst,
+        ncols_x, nrows_x, ncols_y, stride_row_x, ncols_y, nrows_x,
+        num_experts, num_experts, nrows_x * stride_row_x, 0, 0,
+        1, 1, 0, 0, 0,
+        use_stream_k != 0, ncols_max
+    };
+
+    launch_mmq_case_q5_k((float *)tmp_fixup_ptr, args, (cudaStream_t)stream, cc, nsm, smpbo, warp_size_host);
+}

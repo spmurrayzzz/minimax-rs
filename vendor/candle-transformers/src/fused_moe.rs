@@ -246,7 +246,14 @@ impl FusedMoeGGUF {
             topk_weights = topk_weights.broadcast_div(&topk_weights.sum_keepdim(D::Minus1)?)?;
         }
 
-        let (expert_ids, sorted_token_ids) = topk_ids.flatten_all()?.sort_last_dim(true)?;
+        let (expert_ids, sorted_token_ids) = if num_tokens == 1 {
+            // The single-token decode route list fits in one tiny bitonic-sort
+            // block and avoids CUB's setup/allocation overhead.
+            topk_ids.flatten_all()?.sort_last_dim(true)?
+        } else {
+            let num_experts = self.gate_experts.shape().dims3()?.0;
+            moe::sort_routes(&topk_ids, num_experts)?
+        };
         let ys = {
             let gate = moe::moe_gemm_gguf(
                 &xs,

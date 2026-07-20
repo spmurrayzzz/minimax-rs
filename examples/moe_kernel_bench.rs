@@ -58,8 +58,39 @@ fn main() -> Result<()> {
         moe.down_experts.dtype()
     );
 
+    // Exercise a route list larger than Candle's old shared-memory argsort
+    // limit and verify that CUB grouping is stable and exact.
+    let routes: Vec<u32> = (0..2048 * TOPK)
+        .map(|index| ((index * 73 + index / 11) % EXPERTS) as u32)
+        .collect();
+    let routes_tensor = Tensor::from_vec(routes.clone(), routes.len(), &device)?;
+    let (experts_sorted, route_ids_sorted) = candle_nn::moe::sort_routes(&routes_tensor, EXPERTS)?;
+    let experts_sorted = experts_sorted.to_vec1::<u32>()?;
+    let route_ids_sorted = route_ids_sorted.to_vec1::<u32>()?;
+    let mut expected: Vec<(u32, u32)> = routes
+        .into_iter()
+        .enumerate()
+        .map(|(route, expert)| (expert, route as u32))
+        .collect();
+    expected.sort_by_key(|&(expert, _)| expert);
+    assert_eq!(
+        experts_sorted,
+        expected
+            .iter()
+            .map(|&(expert, _)| expert)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        route_ids_sorted,
+        expected.iter().map(|&(_, route)| route).collect::<Vec<_>>()
+    );
+    println!("validated stable routing for {} routes", expected.len());
+
     for (length, iterations) in [
         (1, 50),
+        (5, 30),
+        (16, 20),
+        (32, 12),
         (39, 10),
         (64, 8),
         (128, 6),
@@ -67,28 +98,30 @@ fn main() -> Result<()> {
         (256, 4),
         (384, 3),
         (512, 3),
+        (1024, 2),
+        (2048, 1),
     ] {
         let x = Tensor::randn(0f32, 1f32, (1, length, HIDDEN), &device)?;
         // Compile/load kernels and populate the CUDA allocator before timing.
         let reference = moe.forward(&x, false)?;
-        let tensor_core = moe.forward(&x, true)?;
-        let tensor_core_2 = moe.forward(&x, true)?;
+        let optimized = moe.forward(&x, true)?;
+        let optimized_2 = moe.forward(&x, true)?;
         device.synchronize()?;
-        let wmma_max_abs = (&reference - &tensor_core)?
+        let optimized_max_abs = (&reference - &optimized)?
             .abs()?
             .max_all()?
             .to_scalar::<f32>()?;
-        let wmma_nondeterminism = (&tensor_core - &tensor_core_2)?
+        let optimized_nondeterminism = (&optimized - &optimized_2)?
             .abs()?
             .max_all()?
             .to_scalar::<f32>()?;
         let reference_max = reference.abs()?.max_all()?.to_scalar::<f32>()?;
 
         let generic_ms = elapsed_ms(&device, iterations, || moe.forward(&x, false))?;
-        let wmma_ms = elapsed_ms(&device, iterations, || moe.forward(&x, true))?;
+        let optimized_ms = elapsed_ms(&device, iterations, || moe.forward(&x, true))?;
         println!(
-            "tokens={length:>3} generic={generic_ms:>8.3} ms wmma={wmma_ms:>8.3} ms wmma_speedup={:>5.2}x ref_max={reference_max:.3} wmma_max_abs={wmma_max_abs:.6} wmma_nondet={wmma_nondeterminism:.6}",
-            generic_ms / wmma_ms
+            "tokens={length:>3} generic={generic_ms:>8.3} ms optimized={optimized_ms:>8.3} ms speedup={:>5.2}x ref_max={reference_max:.3} max_abs={optimized_max_abs:.6} nondet={optimized_nondeterminism:.6}",
+            generic_ms / optimized_ms
         );
     }
     Ok(())

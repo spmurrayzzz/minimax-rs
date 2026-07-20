@@ -55,6 +55,31 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn moe_gemm_mmq_gguf(
+        input: *const f32,      // input [source_rows, size_k]
+        weights: *const c_void, // weights [num_experts, size_n, size_k]
+        sorted_token_ids: *const i32,
+        expert_ids: *const i32,
+        topk_weights: *const f32, // device ptr or nullptr
+        output: *mut f32,         // float output [size_m, size_n]
+        num_experts: i32,
+        topk: i32,
+        size_m: i32,
+        size_n: i32,
+        size_k: i32,
+        gguf_dtype: i32,
+        stream: i64,
+    );
+
+    pub fn moe_sort_routes(
+        expert_ids_unsorted: *const u32,
+        expert_ids_sorted: *mut u32,
+        route_ids_sorted: *mut u32,
+        size: i32,
+        end_bit: i32,
+        stream: i64,
+    );
+
     // ============== Dense GGUF MMVQ launchers (from mmvq_gguf.cu) ==============
 
     // BF16 output launchers

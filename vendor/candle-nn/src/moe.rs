@@ -15,6 +15,75 @@ fn wmma_min_tokens() -> usize {
     })
 }
 
+fn mmq_min_tokens() -> usize {
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MINIMAX_MMQ_MIN_TOKENS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(32)
+    })
+}
+
+#[cfg(feature = "cuda")]
+pub fn sort_routes(expert_ids: &Tensor, num_experts: usize) -> Result<(Tensor, Tensor)> {
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
+    use candle::op::BackpropOp;
+
+    let expert_ids = expert_ids.flatten_all()?.contiguous()?;
+    if expert_ids.dtype() != candle::DType::U32 {
+        candle::bail!("MoE route IDs must use u32 storage")
+    }
+    let size = expert_ids.elem_count();
+    let size_i32 = i32::try_from(size).map_err(candle::Error::wrap)?;
+    let end_bit = if num_experts <= 1 {
+        1
+    } else {
+        usize::BITS - (num_experts - 1).leading_zeros()
+    } as i32;
+    let dev = expert_ids.device().as_cuda_device()?;
+    let (storage, _) = expert_ids.storage_and_layout();
+    let expert_ids_src = match &*storage {
+        candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+        _ => candle::bail!("MoE route IDs must be a CUDA tensor"),
+    };
+
+    let expert_ids_sorted = unsafe { dev.alloc::<u32>(size) }?;
+    let route_ids_sorted = unsafe { dev.alloc::<u32>(size) }?;
+    let stream = dev.cuda_stream().cu_stream() as i64;
+    unsafe {
+        ffi::moe_sort_routes(
+            expert_ids_src.device_ptr(expert_ids_src.stream()).0 as *const u32,
+            expert_ids_sorted.device_ptr(expert_ids_sorted.stream()).0 as *mut u32,
+            route_ids_sorted.device_ptr(route_ids_sorted.stream()).0 as *mut u32,
+            size_i32,
+            end_bit,
+            stream,
+        );
+    }
+
+    let expert_ids_sorted = candle::CudaStorage::wrap_cuda_slice(expert_ids_sorted, dev.clone());
+    let expert_ids_sorted = Tensor::from_storage(
+        candle::Storage::Cuda(expert_ids_sorted),
+        (size,),
+        BackpropOp::none(),
+        false,
+    );
+    let route_ids_sorted = candle::CudaStorage::wrap_cuda_slice(route_ids_sorted, dev.clone());
+    let route_ids_sorted = Tensor::from_storage(
+        candle::Storage::Cuda(route_ids_sorted),
+        (size,),
+        BackpropOp::none(),
+        false,
+    );
+    Ok((expert_ids_sorted, route_ids_sorted))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn sort_routes(expert_ids: &Tensor, _num_experts: usize) -> Result<(Tensor, Tensor)> {
+    expert_ids.flatten_all()?.sort_last_dim(true)
+}
+
 #[cfg(feature = "cuda")]
 pub fn moe_gemm(
     input: &Tensor,
@@ -267,12 +336,37 @@ pub fn moe_gemm_gguf(
         use core::ffi::c_void;
 
         assert!(size_k % 8 == 0, "size_k must divisible by 8");
-        // The tensor-core kernel amortizes weight dequantization only on larger
-        // routed batches. It crosses over near 160 tokens on sm_120; keep a
-        // conservative threshold so short prompts do not regress TTFT.
-        let use_wmma_prefill = _is_prefill && num_tokens >= wmma_min_tokens();
+        // MMQ keeps the weights quantized and uses integer tensor cores. The
+        // existing dequantize-to-f16 WMMA path remains as a fallback for GGUF
+        // types not yet wired to the MMQ launcher.
+        let use_mmq_prefill = _is_prefill
+            && num_tokens >= mmq_min_tokens()
+            && matches!(gguf_dtype, 1 | 4);
+        let use_wmma_prefill =
+            _is_prefill && num_tokens >= wmma_min_tokens() && !use_mmq_prefill;
         unsafe {
-            if use_wmma_prefill {
+            if use_mmq_prefill {
+                let (input, _) = input.storage_and_layout();
+                let input = match &*input {
+                    candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+                    _ => candle::bail!("input must be a cuda tensor"),
+                };
+                ffi::moe_gemm_mmq_gguf(
+                    input.device_ptr(input.stream()).0 as *const f32,
+                    weight_ptr as *const c_void,
+                    sorted_token_ids.device_ptr(sorted_token_ids.stream()).0 as *const i32,
+                    experts_ids.device_ptr(experts_ids.stream()).0 as *const i32,
+                    topk_weights_ptr,
+                    output.device_ptr(output.stream()).0 as *mut f32,
+                    num_experts as i32,
+                    topk as i32,
+                    size_m as i32,
+                    size_n as i32,
+                    size_k as i32,
+                    gguf_dtype,
+                    stream,
+                );
+            } else if use_wmma_prefill {
                 let input = input.to_dtype(dtype)?;
                 let (input, _) = input.storage_and_layout();
                 let (input_ptr, input_dtype) = match &*input {

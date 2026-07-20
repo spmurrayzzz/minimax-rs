@@ -42,11 +42,13 @@ fn main() -> Result<()> {
     let mut moe_builder = KernelBuilder::default()
         .source_files(vec![
             "src/moe/moe_gguf.cu",
+            "src/moe/moe_sort.cu",
             "src/moe/moe_wmma.cu",
             "src/moe/moe_wmma_gguf.cu",
             "src/mmvq_gguf.cu",
             "src/decode_attention.cu",
             "src/mmq_gguf/mmq_quantize.cu",
+            "src/mmq_gguf/mmq_moe.cu",
             "src/mmq_gguf/mmq_instance_q4_0.cu",
             "src/mmq_gguf/mmq_instance_q4_1.cu",
             "src/mmq_gguf/mmq_instance_q5_0.cu",

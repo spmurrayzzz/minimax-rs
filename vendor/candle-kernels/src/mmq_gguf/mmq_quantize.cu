@@ -12,7 +12,7 @@ template <mmq_q8_1_ds_layout ds_layout>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int ne1, const int ne2) {
+        const int64_t ne0, const int ne1, const int ne2, const int id_divisor) {
 
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
@@ -28,7 +28,7 @@ static __global__ void quantize_mmq_q8_1(
     const int64_t i3 = blockIdx.z / ne2;
 
     const int64_t i00 = i0;
-    const int64_t i01 = ids ? ids[i1] : i1;
+    const int64_t i01 = ids ? ids[i1] / id_divisor : i1;
     const int64_t i02 = i2;
     const int64_t i03 = i3;
 
@@ -117,7 +117,7 @@ extern "C" void launch_mmq_quantize_q8_1_D4(
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
     quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4>
         <<<num_blocks, block_size, 0, (cudaStream_t)stream>>>(
-            (const float *)x_f32, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+            (const float *)x_f32, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 1);
 }
 
 extern "C" void launch_mmq_quantize_q8_1_DS4(
@@ -129,7 +129,7 @@ extern "C" void launch_mmq_quantize_q8_1_DS4(
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
     quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4>
         <<<num_blocks, block_size, 0, (cudaStream_t)stream>>>(
-            (const float *)x_f32, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+            (const float *)x_f32, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 1);
 }
 
 extern "C" void launch_mmq_quantize_q8_1_D2S6(
@@ -141,5 +141,20 @@ extern "C" void launch_mmq_quantize_q8_1_D2S6(
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
     quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6>
         <<<num_blocks, block_size, 0, (cudaStream_t)stream>>>(
-            (const float *)x_f32, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+            (const float *)x_f32, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 1);
+}
+
+// MoE rows are compacted in expert order. For the first two projections,
+// sorted_ids contains flattened token/top-k indices, so id_divisor=top_k maps
+// each route back to its source token. The down projection passes 1 because
+// its input already has one row per route.
+extern "C" void launch_mmq_quantize_q8_1_moe_DS4(
+    const void *x_f32, const int32_t *sorted_ids, int id_divisor, void *vy,
+    int64_t ne00, int64_t s01, int64_t ne0, int64_t ne1, void *stream) {
+    const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3 num_blocks(ne1, block_num_y, 1);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4>
+        <<<num_blocks, block_size, 0, (cudaStream_t)stream>>>(
+            (const float *)x_f32, sorted_ids, vy, ne00, s01, 0, 0, ne0, ne1, 1, id_divisor);
 }
