@@ -118,6 +118,35 @@ fn tool_function(tool: &Value) -> Result<&Value> {
         .context("each tool must contain a function object")
 }
 
+// llama.cpp round-trips OpenAI tools through `common_chat_tool`, retaining only
+// these three function fields and supplying defaults before Jinja rendering.
+fn render_tool_function(tool: &Value, output: &mut String) -> Result<()> {
+    let function = tool_function(tool)?;
+    let name = function
+        .get("name")
+        .and_then(Value::as_str)
+        .context("each tool function must have a string name")?;
+    let description = match function.get("description") {
+        None => "",
+        Some(description) => description
+            .as_str()
+            .context("each tool function description must be a string")?,
+    };
+
+    output.push_str("{\"name\": ");
+    output.push_str(&serde_json::to_string(name)?);
+    output.push_str(", \"description\": ");
+    output.push_str(&serde_json::to_string(description)?);
+    output.push_str(", \"parameters\": ");
+    if let Some(parameters) = function.get("parameters") {
+        json_jinja(parameters, output)?;
+    } else {
+        output.push_str("{}");
+    }
+    output.push('}');
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 struct ToolDefinition {
     parameters: Value,
@@ -341,7 +370,7 @@ pub fn render_prompt(
         prompt.push_str("Here are the tools available in JSONSchema format:\n\n<tools>\n");
         for tool in tools {
             prompt.push_str("<tool>");
-            json_jinja(tool_function(tool)?, &mut prompt)?;
+            render_tool_function(tool, &mut prompt)?;
             prompt.push_str("</tool>\n");
         }
         prompt.push_str(
@@ -2127,7 +2156,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_tool_definitions_without_coupling_to_json_key_order() {
+    fn renders_native_tool_instructions() {
         let tools = vec![function_tool("read")];
         let prompt = render_prompt(&[text_message("user", "Open README.md")], &tools, false)
             .expect("render tools");
@@ -2137,6 +2166,24 @@ mod tests {
         assert!(prompt.contains(r#""name": "read""#));
         assert!(prompt.contains("<invoke name=\"tool-name-1\">"));
         assert!(registry(&tools).definitions.contains_key("read"));
+    }
+
+    #[test]
+    fn renders_canonical_tool_prompt_like_llama_cpp() {
+        let request: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/minimax-tool-prompt-request.json"
+        ))
+        .expect("valid OpenAI request fixture");
+        let messages = serde_json::from_value::<Vec<ChatMessage>>(request["messages"].clone())
+            .expect("valid messages");
+        let tools = request["tools"].as_array().expect("tool array");
+
+        let prompt = render_prompt(&messages, tools, false).expect("render prompt");
+
+        assert_eq!(
+            prompt,
+            include_str!("../tests/fixtures/minimax-tool-prompt.txt")
+        );
     }
 
     #[test]

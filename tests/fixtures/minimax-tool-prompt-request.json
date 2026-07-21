@@ -1,0 +1,53 @@
+{
+  "messages": [
+    {"role": "system", "content": "System policy."},
+    {"role": "user", "content": "Run both."},
+    {
+      "role": "assistant",
+      "content": "Working.",
+      "tool_calls": [
+        {
+          "id": "call_previous",
+          "type": "function",
+          "function": {
+            "name": "lookup",
+            "arguments": {"second": 2, "first": " one "}
+          }
+        }
+      ]
+    },
+    {"role": "tool", "tool_call_id": "call_previous", "content": "done"},
+    {"role": "user", "content": "Continue."}
+  ],
+  "tools": [
+    {
+      "x-top-level": "drop me",
+      "function": {
+        "parameters": {
+          "required": ["zeta", "alpha"],
+          "properties": {
+            "zeta": {"description": "Z value", "type": "integer"},
+            "alpha": {"enum": ["a", "b"], "type": "string"}
+          },
+          "type": "object",
+          "additionalProperties": false
+        },
+        "strict": true,
+        "name": "lookup",
+        "description": "Look up values",
+        "x-function": "drop me too"
+      },
+      "type": "function"
+    },
+    {
+      "type": "function",
+      "function": {
+        "x-function": 7,
+        "name": "ping"
+      }
+    }
+  ],
+  "bos_token": "",
+  "eos_token": "",
+  "add_generation_prompt": true
+}

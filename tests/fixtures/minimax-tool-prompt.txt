@@ -1,0 +1,37 @@
+]~!b[]~b]system
+System policy.
+
+# Tools
+You may call one or more tools to assist with the user query.
+Here are the tools available in JSONSchema format:
+
+<tools>
+<tool>{"name": "lookup", "description": "Look up values", "parameters": {"required": ["zeta", "alpha"], "properties": {"zeta": {"description": "Z value", "type": "integer"}, "alpha": {"enum": ["a", "b"], "type": "string"}}, "type": "object", "additionalProperties": false}}</tool>
+<tool>{"name": "ping", "description": "", "parameters": {}}</tool>
+</tools>
+
+When making tool calls, use XML format to invoke tools and pass parameters:
+
+<minimax:tool_call>
+<invoke name="tool-name-1">
+<parameter name="param-key-1">param-value-1</parameter>
+<parameter name="param-key-2">param-value-2</parameter>
+...
+</invoke>
+</minimax:tool_call>[e~[
+]~b]user
+Run both.[e~[
+]~b]ai
+Working.
+<minimax:tool_call>
+<invoke name="lookup">
+<parameter name="second">2</parameter>
+<parameter name="first"> one </parameter>
+</invoke>
+</minimax:tool_call>[e~[
+]~b]tool
+<response>done</response>[e~[
+]~b]user
+Continue.[e~[
+]~b]ai
+<think>
