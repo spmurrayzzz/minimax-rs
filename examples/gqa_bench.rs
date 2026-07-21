@@ -33,6 +33,17 @@ fn fused(q: &Tensor, k: &Tensor, v: &Tensor, splits: usize) -> candle_core::Resu
     )
 }
 
+fn flash_decode(q: &Tensor, k: &Tensor, v: &Tensor) -> candle_core::Result<Tensor> {
+    candle_flash_attn::flash_attn(
+        &q.transpose(1, 2)?,
+        &k.transpose(1, 2)?,
+        &v.transpose(1, 2)?,
+        1.0 / (HD as f32).sqrt(),
+        true,
+    )?
+    .transpose(1, 2)
+}
+
 fn old_prefill(q: &Tensor, k: &Tensor, v: &Tensor) -> candle_core::Result<Tensor> {
     let (_, _, seq_len, _) = q.dims4()?;
     let k = repeat_kv(k.clone(), QH / KVH)?.contiguous()?;
@@ -124,7 +135,12 @@ fn main() -> Result<()> {
         (256, 600),
         (512, 500),
         (4096, 100),
+        (8191, 50),
+        (8192, 50),
+        (8193, 50),
+        (12288, 40),
         (16384, 30),
+        (24576, 20),
         (32768, 20),
         (65536, 10),
         (71134, 10),
@@ -146,6 +162,7 @@ fn main() -> Result<()> {
         let candidate = grouped(&q, &k, &v)?;
         let fused_candidate =
             candle_nn::fused_attention::gqa_decode_f16_128(&q, &k, &v, 1.0 / (HD as f32).sqrt())?;
+        let flash_candidate = flash_decode(&q, &k, &v)?;
         device.synchronize()?;
         let max_abs = (&reference - &candidate)?
             .abs()?
@@ -157,17 +174,25 @@ fn main() -> Result<()> {
             .to_dtype(DType::F32)?
             .max_all()?
             .to_scalar::<f32>()?;
+        let flash_max_abs = (&reference - &flash_candidate)?
+            .abs()?
+            .to_dtype(DType::F32)?
+            .max_all()?
+            .to_scalar::<f32>()?;
         let old_ms = elapsed_ms(&device, iterations, || old(&q, &k, &v))?;
         let grouped_ms = elapsed_ms(&device, iterations, || grouped(&q, &k, &v))?;
         let fused_auto_ms = elapsed_ms(&device, iterations, || {
             candle_nn::fused_attention::gqa_decode_f16_128(&q, &k, &v, 1.0 / (HD as f32).sqrt())
         })?;
+        let fused8_ms = elapsed_ms(&device, iterations, || fused(&q, &k, &v, 8))?;
+        let fused16_ms = elapsed_ms(&device, iterations, || fused(&q, &k, &v, 16))?;
         let fused32_ms = elapsed_ms(&device, iterations, || fused(&q, &k, &v, 32))?;
         let fused64_ms = elapsed_ms(&device, iterations, || fused(&q, &k, &v, 64))?;
         let fused80_ms = elapsed_ms(&device, iterations, || fused(&q, &k, &v, 80))?;
         let fused96_ms = elapsed_ms(&device, iterations, || fused(&q, &k, &v, 96))?;
+        let flash_ms = elapsed_ms(&device, iterations, || flash_decode(&q, &k, &v))?;
         println!(
-            "decode context={context:>5} repeat={old_ms:.4}ms grouped={grouped_ms:.4}ms fused_auto={fused_auto_ms:.4}ms fused32={fused32_ms:.4}ms fused64={fused64_ms:.4}ms fused80={fused80_ms:.4}ms fused96={fused96_ms:.4}ms speedup={:.2}x grouped_abs={max_abs:.9} fused_abs={fused_max_abs:.9}",
+            "decode context={context:>5} repeat={old_ms:.4}ms grouped={grouped_ms:.4}ms fused_auto={fused_auto_ms:.4}ms fused8={fused8_ms:.4}ms fused16={fused16_ms:.4}ms fused32={fused32_ms:.4}ms fused64={fused64_ms:.4}ms fused80={fused80_ms:.4}ms fused96={fused96_ms:.4}ms flash={flash_ms:.4}ms speedup={:.2}x grouped_abs={max_abs:.9} fused_abs={fused_max_abs:.9} flash_abs={flash_max_abs:.9}",
             grouped_ms / fused_auto_ms
         );
     }

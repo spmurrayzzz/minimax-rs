@@ -21,11 +21,21 @@ pub fn gqa_decode_f16_128(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Res
     // Keep enough independent blocks in flight to fill the 188-SM target GPU,
     // without making each split so short that launch/combine overhead wins.
     // These crossover points come from examples/gqa_bench.rs on sm_120.
-    let num_splits = match k.dim(2)? {
-        0..2_048 => 32,
-        2_048..24_576 => 64,
-        24_576..49_152 => 80,
-        _ => 96,
+    let seq_len = k.dim(2)?;
+    let num_splits = if seq_len >= 8_192 {
+        // The MMA kernel partitions 128-key tiles. Long-running blocks need
+        // fewer splits than the scalar path. The 64-split middle band is the
+        // favorable launch wave on the 188-SM target; 16 wins on either side.
+        if (20_480..49_152).contains(&seq_len) {
+            64
+        } else {
+            16
+        }
+    } else {
+        match seq_len {
+            0..2_048 => 32,
+            _ => 64,
+        }
     };
     gqa_decode_f16_128_with_splits(q, k, v, scale, num_splits)
 }
@@ -224,22 +234,47 @@ fn gqa_f16_128_with_splits(
     let output = unsafe { dev.alloc::<half::f16>(output_count) }?;
     let stream = dev.cuda_stream();
     unsafe {
-        ffi::launch_gqa_f16_128(
-            q_slice.device_ptr(&stream).0 as *const std::ffi::c_void,
-            k_slice.device_ptr(&stream).0 as *const std::ffi::c_void,
-            v_slice.device_ptr(&stream).0 as *const std::ffi::c_void,
-            partials.device_ptr(partials.stream()).0 as *mut std::ffi::c_void,
-            output.device_ptr(output.stream()).0 as *mut std::ffi::c_void,
-            query_len as i32,
-            past_len as i32,
-            q_head_stride,
-            q_seq_stride,
-            k_head_stride,
-            v_head_stride,
-            num_splits as i32,
-            scale,
-            stream.cu_stream() as *mut std::ffi::c_void,
-        );
+        let q_ptr = q_slice.device_ptr(&stream).0 as *const std::ffi::c_void;
+        let k_ptr = k_slice.device_ptr(&stream).0 as *const std::ffi::c_void;
+        let v_ptr = v_slice.device_ptr(&stream).0 as *const std::ffi::c_void;
+        let partials_ptr =
+            partials.device_ptr(partials.stream()).0 as *mut std::ffi::c_void;
+        let output_ptr = output.device_ptr(output.stream()).0 as *mut std::ffi::c_void;
+        let stream_ptr = stream.cu_stream() as *mut std::ffi::c_void;
+        if query_len == 1 && seq_len >= 8_192 {
+            ffi::launch_gqa_decode_mma_f16_128(
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                partials_ptr,
+                output_ptr,
+                seq_len as i32,
+                q_head_stride,
+                k_head_stride,
+                v_head_stride,
+                num_splits as i32,
+                scale,
+                stream.context().ordinal() as i32,
+                stream_ptr,
+            );
+        } else {
+            ffi::launch_gqa_f16_128(
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                partials_ptr,
+                output_ptr,
+                query_len as i32,
+                past_len as i32,
+                q_head_stride,
+                q_seq_stride,
+                k_head_stride,
+                v_head_stride,
+                num_splits as i32,
+                scale,
+                stream_ptr,
+            );
+        }
     }
 
     let output = candle::CudaStorage::wrap_cuda_slice(output, dev.clone());

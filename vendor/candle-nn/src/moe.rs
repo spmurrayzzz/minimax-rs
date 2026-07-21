@@ -450,6 +450,126 @@ pub fn moe_gemm_gguf(
     }
 }
 
+/// Fused one-token, top-8 GGUF MoE decode with a SiLU gate.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn moe_decode_gguf_silu(
+    input: &Tensor,
+    gate_weights: &QTensor,
+    up_weights: &QTensor,
+    down_weights: &QTensor,
+    topk_weights: &Tensor,
+    sorted_token_ids: &Tensor,
+    expert_ids: &Tensor,
+    topk: usize,
+) -> Result<Tensor> {
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
+    use candle::cuda_backend::kernels::ffi;
+    use candle::op::BackpropOp;
+    use candle::quantized::GgmlDType;
+    use candle::DType;
+    use core::ffi::c_void;
+
+    let (num_tokens, hidden_size) = input.dims2()?;
+    let (num_experts, intermediate_size, gate_hidden) = gate_weights.shape().dims3()?;
+    let up_shape = up_weights.shape().dims3()?;
+    let down_shape = down_weights.shape().dims3()?;
+    if input.dtype() != DType::F32
+        || num_tokens != 1
+        || topk != 8
+        || gate_hidden != hidden_size
+        || up_shape != (num_experts, intermediate_size, hidden_size)
+        || down_shape != (num_experts, hidden_size, intermediate_size)
+        || gate_weights.dtype() != up_weights.dtype()
+        || topk_weights.elem_count() != topk
+        || sorted_token_ids.elem_count() != topk
+        || expert_ids.elem_count() != topk
+    {
+        candle::bail!("invalid tensors for fused GGUF MoE decode")
+    }
+    let quant_type = |dtype| match dtype {
+        GgmlDType::Q8_0 => Ok(0),
+        GgmlDType::Q4K => Ok(1),
+        GgmlDType::Q2K => Ok(2),
+        GgmlDType::Q3K => Ok(3),
+        GgmlDType::Q5K => Ok(4),
+        GgmlDType::Q6K => Ok(5),
+        _ => candle::bail!("unsupported GGUF type for fused MoE decode: {dtype:?}"),
+    };
+    let gate_up_quant_type = quant_type(gate_weights.dtype())?;
+    let down_quant_type = quant_type(down_weights.dtype())?;
+    let input = input.contiguous()?;
+    let topk_weights = topk_weights.contiguous()?;
+    let sorted_token_ids = sorted_token_ids.contiguous()?;
+    let expert_ids = expert_ids.contiguous()?;
+    let dev = input.device().as_cuda_device()?;
+
+    let (input_storage, _) = input.storage_and_layout();
+    let input = match &*input_storage {
+        candle::Storage::Cuda(storage) => storage.as_cuda_slice::<f32>()?,
+        _ => candle::bail!("fused MoE input must be a CUDA tensor"),
+    };
+    let (topk_storage, _) = topk_weights.storage_and_layout();
+    let topk_weights = match &*topk_storage {
+        candle::Storage::Cuda(storage) => storage.as_cuda_slice::<f32>()?,
+        _ => candle::bail!("fused MoE route weights must be a CUDA tensor"),
+    };
+    let (route_storage, _) = sorted_token_ids.storage_and_layout();
+    let sorted_token_ids = match &*route_storage {
+        candle::Storage::Cuda(storage) => storage.as_cuda_slice::<u32>()?,
+        _ => candle::bail!("fused MoE route IDs must be a CUDA tensor"),
+    };
+    let (expert_storage, _) = expert_ids.storage_and_layout();
+    let expert_ids = match &*expert_storage {
+        candle::Storage::Cuda(storage) => storage.as_cuda_slice::<u32>()?,
+        _ => candle::bail!("fused MoE expert IDs must be a CUDA tensor"),
+    };
+
+    let output = unsafe { dev.alloc::<f32>(hidden_size) }?;
+    let stream = dev.cuda_stream();
+    unsafe {
+        ffi::moe_gemm_gguf_decode_silu(
+            input.device_ptr(input.stream()).0 as *const f32,
+            gate_weights.device_ptr()? as *const c_void,
+            up_weights.device_ptr()? as *const c_void,
+            down_weights.device_ptr()? as *const c_void,
+            sorted_token_ids.device_ptr(sorted_token_ids.stream()).0 as *const i32,
+            expert_ids.device_ptr(expert_ids.stream()).0 as *const i32,
+            topk_weights.device_ptr(topk_weights.stream()).0 as *const f32,
+            output.device_ptr(output.stream()).0 as *mut f32,
+            num_experts as i32,
+            topk as i32,
+            hidden_size as i32,
+            intermediate_size as i32,
+            gate_up_quant_type,
+            down_quant_type,
+            stream.cu_stream() as i64,
+        );
+    }
+    let output = candle::CudaStorage::wrap_cuda_slice(output, dev.clone());
+    Ok(Tensor::from_storage(
+        candle::Storage::Cuda(output),
+        (1, hidden_size),
+        BackpropOp::none(),
+        false,
+    ))
+}
+
+#[cfg(not(feature = "cuda"))]
+#[allow(clippy::too_many_arguments)]
+pub fn moe_decode_gguf_silu(
+    _: &Tensor,
+    _: &QTensor,
+    _: &QTensor,
+    _: &QTensor,
+    _: &Tensor,
+    _: &Tensor,
+    _: &Tensor,
+    _: usize,
+) -> Result<Tensor> {
+    candle::bail!("fused GGUF MoE decode is only implemented for CUDA")
+}
+
 #[cfg(not(feature = "cuda"))]
 #[allow(clippy::too_many_arguments)]
 pub fn moe_gemm_gguf(

@@ -254,7 +254,22 @@ impl FusedMoeGGUF {
             let num_experts = self.gate_experts.shape().dims3()?.0;
             moe::sort_routes(&topk_ids, num_experts)?
         };
-        let ys = {
+        let mut ys = if num_tokens == 1
+            && self.num_experts_per_tok == 8
+            && self.act == Activation::Silu
+            && self.gate_experts.dtype() == self.up_experts.dtype()
+        {
+            moe::moe_decode_gguf_silu(
+                &xs,
+                &self.gate_experts,
+                &self.up_experts,
+                &self.down_experts,
+                &topk_weights,
+                &sorted_token_ids,
+                &expert_ids,
+                self.num_experts_per_tok,
+            )?
+        } else {
             let gate = moe::moe_gemm_gguf(
                 &xs,
                 &self.gate_experts,
@@ -275,7 +290,6 @@ impl FusedMoeGGUF {
                 is_prefill,
                 self.dtype,
             )?;
-
             let down_inputs = (up * gate.apply(&self.act)?)?;
             moe::moe_gemm_gguf(
                 &down_inputs,
@@ -287,8 +301,9 @@ impl FusedMoeGGUF {
                 is_prefill,
                 self.dtype,
             )?
+            .reshape((num_tokens, (), hidden_dim))?
+            .sum(D::Minus2)?
         };
-        let mut ys = ys.reshape((num_tokens, (), hidden_dim))?.sum(D::Minus2)?;
         if ys.dtype() != original_dtype {
             ys = ys.to_dtype(original_dtype)?;
         }

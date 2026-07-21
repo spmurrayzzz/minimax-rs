@@ -38,6 +38,24 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn moe_gemm_gguf_decode_silu(
+        input: *const f32,
+        gate_weights: *const c_void,
+        up_weights: *const c_void,
+        down_weights: *const c_void,
+        sorted_token_ids: *const i32,
+        expert_ids: *const i32,
+        topk_weights: *const f32,
+        output: *mut f32,
+        num_experts: i32,
+        topk: i32,
+        hidden_size: i32,
+        intermediate_size: i32,
+        gate_up_gguf_dtype: i32,
+        down_gguf_dtype: i32,
+        stream: i64,
+    );
+
     pub fn moe_gemm_gguf_prefill(
         input: *const c_void, // input [size_m, size_k]
         weights: *const u8,   // weights [num_experts, size_n, size_k]
@@ -485,6 +503,21 @@ extern "C" {
         head_dim: i32,
         rope_dim: i32,
         position: i32,
+        stream: *mut c_void,
+    );
+    pub fn launch_gqa_decode_mma_f16_128(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        partials: *mut c_void,
+        output: *mut c_void,
+        seq_len: i32,
+        q_head_stride: i32,
+        k_head_stride: i32,
+        v_head_stride: i32,
+        num_splits: i32,
+        scale: f32,
+        device_ordinal: i32,
         stream: *mut c_void,
     );
     pub fn launch_gqa_f16_128(

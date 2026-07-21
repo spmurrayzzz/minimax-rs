@@ -90,7 +90,7 @@ fn flash_prefill_matches_grouped_causal_attention() -> Result<()> {
         );
     }
 
-    for context in [1, 8, 513] {
+    for context in [1, 8, 513, 8_192, 8_193, 12_288] {
         let (q, k, v) = random_cache(&device, 1, context - 1)?;
         let reference = grouped_causal_reference(&q, &k, &v, context - 1)?;
         let candidate = candle_nn::fused_attention::gqa_decode_f16_128(
@@ -110,6 +110,30 @@ fn flash_prefill_matches_grouped_causal_attention() -> Result<()> {
             "decode context={context} max_abs={max_abs}"
         );
     }
+
+    // The production cache has padded head strides, but the public kernel must
+    // also zero-stage its final MMA tail correctly for exact allocations.
+    let context = 8_193;
+    let q =
+        Tensor::randn(0f32, 1f32, (1, QUERY_HEADS, 1, HEAD_DIM), &device)?.to_dtype(DType::F16)?;
+    let k = Tensor::randn(0f32, 1f32, (1, KV_HEADS, context, HEAD_DIM), &device)?
+        .to_dtype(DType::F16)?;
+    let v = Tensor::randn(0f32, 1f32, (1, KV_HEADS, context, HEAD_DIM), &device)?
+        .to_dtype(DType::F16)?;
+    let reference = grouped_causal_reference(&q, &k, &v, context - 1)?;
+    let candidate =
+        candle_nn::fused_attention::gqa_decode_f16_128(&q, &k, &v, 1.0 / (HEAD_DIM as f32).sqrt())?;
+    let max_abs = (&reference - &candidate)?
+        .abs()?
+        .to_dtype(DType::F32)?
+        .max_all()?
+        .to_scalar::<f32>()?;
+    eprintln!("exact decode context={context} max_abs={max_abs}");
+    assert!(
+        max_abs <= 0.003_906_25,
+        "context={context} max_abs={max_abs}"
+    );
+
     Ok(())
 }
 
