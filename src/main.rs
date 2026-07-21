@@ -777,6 +777,14 @@ impl ChatRequest {
             .unwrap_or(DEFAULT_MAX_TOKENS)
     }
 }
+
+fn request_tool_policy(
+    req: &ChatRequest,
+) -> std::result::Result<chat::ToolPolicy, (StatusCode, String)> {
+    chat::ToolPolicy::from_request(&req.tools, req.tool_choice.as_ref())
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))
+}
+
 #[derive(Serialize)]
 struct ChatResponse {
     id: String,
@@ -1060,24 +1068,19 @@ async fn chat_completions(
         Err(error) => return api_error(StatusCode::BAD_REQUEST, &error.to_string()),
     };
     let max_tokens = req.output_limit();
+    let tool_policy = match request_tool_policy(&req) {
+        Ok(policy) => policy,
+        Err((status, message)) => return api_error(status, &message),
+    };
     let stop_sequences = match normalize_stop_sequences(req.stop) {
         Ok(stops) => stops,
         Err(error) => return api_error(StatusCode::BAD_REQUEST, &error.to_string()),
     };
-    let tools = if req
-        .tool_choice
-        .as_ref()
-        .is_some_and(|choice| choice == "none")
-    {
-        Vec::new()
-    } else {
-        req.tools.clone()
-    };
-    let tool_registry = match chat::ToolRegistry::from_tools(&tools) {
-        Ok(registry) => registry,
-        Err(error) => return api_error(StatusCode::BAD_REQUEST, &error.to_string()),
-    };
-    let prompt = match chat::render_prompt(&req.messages, &tools) {
+    let prompt = match chat::render_prompt(
+        &req.messages,
+        tool_policy.tools(),
+        tool_policy.requires_call(),
+    ) {
         Ok(prompt) => prompt,
         Err(error) => return api_error(StatusCode::BAD_REQUEST, &error.to_string()),
     };
@@ -1115,7 +1118,7 @@ async fn chat_completions(
         let stream_id = id.clone();
         let stream_model = model_name.clone();
         tokio::task::spawn_blocking(move || {
-            let mut parser = chat::ChatStreamParser::new(markers, tool_registry.clone());
+            let mut parser = chat::ChatStreamParser::new(markers, tool_policy.registry().clone());
             let mut streamed_tool_calls = false;
             let token_sender = sender.clone();
             let generation =
@@ -1162,7 +1165,7 @@ async fn chat_completions(
                     true
                 });
             match generation {
-                Ok(generation) => {
+                Ok(generation) => 'complete: {
                     for delta in parser.finish() {
                         if let chat::StreamDelta::Content(content) = delta {
                             let _ = send_sse(
@@ -1181,7 +1184,17 @@ async fn chat_completions(
                             );
                         }
                     }
-                    let parsed = chat::parse_assistant(&generation.text, &tool_registry);
+                    let parsed = chat::parse_assistant(&generation.text, tool_policy.registry());
+                    if let Err(error) = tool_policy.validate_calls(&parsed.tool_calls) {
+                        let _ = send_sse(
+                            &sender,
+                            serde_json::json!({"error": {
+                                "message": error.to_string(),
+                                "type": "server_error"
+                            }}),
+                        );
+                        break 'complete;
+                    }
                     // If an unusual token split prevented the incremental parser
                     // from emitting a completed call, emit it once before finish.
                     if !streamed_tool_calls && !parsed.tool_calls.is_empty() {
@@ -1261,7 +1274,10 @@ async fn chat_completions(
         Ok(Err(error)) => return api_error(StatusCode::SERVICE_UNAVAILABLE, &error.to_string()),
         Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    let parsed = chat::parse_assistant(&generation.text, &tool_registry);
+    let parsed = chat::parse_assistant(&generation.text, tool_policy.registry());
+    if let Err(error) = tool_policy.validate_calls(&parsed.tool_calls) {
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, &error.to_string());
+    }
     let reason = finish_reason(&generation, !parsed.tool_calls.is_empty());
     let usage = generation_usage(prompt_tokens, &generation);
     Json(ChatResponse {
@@ -1687,6 +1703,34 @@ mod tests {
             truncate_at_stop("before 終わり after".to_owned(), &stops)
         );
         assert_eq!(truncate_at_stop("no match".to_owned(), &stops), "no match");
+    }
+
+    #[test]
+    fn invalid_tool_choices_map_to_http_400() {
+        let invalid_choices = [
+            json!("any"),
+            json!(false),
+            json!({"type": "function"}),
+            json!({"type": "function", "function": {"name": "missing"}}),
+        ];
+        for tool_choice in invalid_choices {
+            let request = serde_json::from_value::<ChatRequest>(json!({
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "parameters": {"type": "object"}
+                    }
+                }],
+                "tool_choice": tool_choice
+            }))
+            .expect("chat request");
+            let Err((status, _message)) = request_tool_policy(&request) else {
+                panic!("invalid tool_choice was accepted")
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
     }
 
     #[test]

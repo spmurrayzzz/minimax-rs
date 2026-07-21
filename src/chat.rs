@@ -163,6 +163,119 @@ impl ToolRegistry {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolChoice {
+    Auto,
+    None,
+    Required,
+    Function(String),
+}
+
+impl ToolChoice {
+    fn parse(choice: Option<&Value>) -> Result<Self> {
+        match choice {
+            None | Some(Value::Null) => Ok(Self::Auto),
+            Some(Value::String(choice)) => match choice.as_str() {
+                "auto" => Ok(Self::Auto),
+                "none" => Ok(Self::None),
+                "required" => Ok(Self::Required),
+                _ => bail!(
+                    "invalid tool_choice {choice:?}; expected \"auto\", \"none\", \"required\", or a function object"
+                ),
+            },
+            Some(Value::Object(choice)) => {
+                if choice.get("type").and_then(Value::as_str) != Some("function") {
+                    bail!("tool_choice.type must be \"function\"")
+                }
+                let name = choice
+                    .get("function")
+                    .and_then(Value::as_object)
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .context("tool_choice.function.name must be a non-empty string")?;
+                Ok(Self::Function(name.to_owned()))
+            }
+            Some(_) => {
+                bail!("tool_choice must be \"auto\", \"none\", \"required\", or a function object")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolPolicy {
+    tools: Vec<Value>,
+    registry: ToolRegistry,
+    requires_call: bool,
+}
+
+impl ToolPolicy {
+    pub fn from_request(tools: &[Value], choice: Option<&Value>) -> Result<Self> {
+        let registry = ToolRegistry::from_tools(tools)?;
+        match ToolChoice::parse(choice)? {
+            ToolChoice::Auto => Ok(Self {
+                tools: tools.to_vec(),
+                registry,
+                requires_call: false,
+            }),
+            ToolChoice::None => Ok(Self {
+                tools: Vec::new(),
+                registry: ToolRegistry::default(),
+                requires_call: false,
+            }),
+            ToolChoice::Required => {
+                if tools.is_empty() {
+                    bail!("tool_choice \"required\" requires at least one tool")
+                }
+                Ok(Self {
+                    tools: tools.to_vec(),
+                    registry,
+                    requires_call: true,
+                })
+            }
+            ToolChoice::Function(name) => {
+                let tool = tools
+                    .iter()
+                    .find(|tool| {
+                        tool_function(tool)
+                            .ok()
+                            .and_then(|function| function.get("name"))
+                            .and_then(Value::as_str)
+                            == Some(name.as_str())
+                    })
+                    .cloned()
+                    .with_context(|| format!("tool_choice selects unknown function {name:?}"))?;
+                let tools = vec![tool];
+                Ok(Self {
+                    registry: ToolRegistry::from_tools(&tools)?,
+                    tools,
+                    requires_call: true,
+                })
+            }
+        }
+    }
+
+    pub fn tools(&self) -> &[Value] {
+        &self.tools
+    }
+
+    pub fn registry(&self) -> &ToolRegistry {
+        &self.registry
+    }
+
+    pub fn requires_call(&self) -> bool {
+        self.requires_call
+    }
+
+    pub fn validate_calls(&self, calls: &[AssistantToolCall]) -> Result<()> {
+        if self.requires_call && calls.is_empty() {
+            bail!("tool_choice requires at least one valid tool call")
+        }
+        Ok(())
+    }
+}
+
 fn incoming_tool_call(call: &Value) -> Result<(String, Map<String, Value>)> {
     let call = call.get("function").unwrap_or(call);
     let name = call
@@ -185,7 +298,11 @@ fn incoming_tool_call(call: &Value) -> Result<(String, Map<String, Value>)> {
 
 /// Render MiniMax-M2.7's native chat template, including tool definitions and
 /// prior assistant/tool turns. This mirrors chat_template.jinja in the model.
-pub fn render_prompt(messages: &[ChatMessage], tools: &[Value]) -> Result<String> {
+pub fn render_prompt(
+    messages: &[ChatMessage],
+    tools: &[Value],
+    requires_tool_call: bool,
+) -> Result<String> {
     if messages.is_empty() {
         bail!("messages must not be empty")
     }
@@ -215,10 +332,13 @@ pub fn render_prompt(messages: &[ChatMessage], tools: &[Value]) -> Result<String
     }
 
     if !tools.is_empty() {
-        prompt.push_str(
-            "\n\n# Tools\nYou may call one or more tools to assist with the user query.\n\
-             Here are the tools available in JSONSchema format:\n\n<tools>\n",
-        );
+        prompt.push_str("\n\n# Tools\n");
+        prompt.push_str(if requires_tool_call {
+            "You must call one or more tools to assist with the user query.\n"
+        } else {
+            "You may call one or more tools to assist with the user query.\n"
+        });
+        prompt.push_str("Here are the tools available in JSONSchema format:\n\n<tools>\n");
         for tool in tools {
             prompt.push_str("<tool>");
             json_jinja(tool_function(tool)?, &mut prompt)?;
@@ -1768,7 +1888,8 @@ mod tests {
 
     #[test]
     fn renders_the_native_default_conversation_envelope() {
-        let prompt = render_prompt(&[text_message("user", "Hello")], &[]).expect("render prompt");
+        let prompt =
+            render_prompt(&[text_message("user", "Hello")], &[], false).expect("render prompt");
 
         assert_eq!(
             prompt,
@@ -1791,8 +1912,8 @@ mod tests {
         system.current_date = Some("2026-04-01".to_owned());
         system.current_location = Some("London".to_owned());
 
-        let prompt =
-            render_prompt(&[system, text_message("user", "Hi")], &[]).expect("render prompt");
+        let prompt = render_prompt(&[system, text_message("user", "Hi")], &[], false)
+            .expect("render prompt");
         assert!(prompt.starts_with(
             "]~!b[]~b]system\nFollow policy.\nCurrent date: 2026-04-01\nCurrent location: London[e~[\n"
         ));
@@ -1802,14 +1923,136 @@ mod tests {
     #[test]
     fn renders_tool_definitions_without_coupling_to_json_key_order() {
         let tools = vec![function_tool("read")];
-        let prompt =
-            render_prompt(&[text_message("user", "Open README.md")], &tools).expect("render tools");
+        let prompt = render_prompt(&[text_message("user", "Open README.md")], &tools, false)
+            .expect("render tools");
 
         assert!(prompt.contains("# Tools\n"));
         assert!(prompt.contains("<tools>\n<tool>"));
         assert!(prompt.contains(r#""name": "read""#));
         assert!(prompt.contains("<invoke name=\"tool-name-1\">"));
         assert!(registry(&tools).definitions.contains_key("read"));
+    }
+
+    #[test]
+    fn resolves_tool_choice_before_rendering_and_parsing() {
+        let tools = vec![function_tool("read"), empty_function_tool("write")];
+
+        let auto = ToolPolicy::from_request(&tools, Some(&json!("auto"))).expect("auto");
+        assert_eq!(auto.tools().len(), 2);
+        assert!(!auto.requires_call());
+
+        let none = ToolPolicy::from_request(&tools, Some(&json!("none"))).expect("none");
+        assert!(none.tools().is_empty());
+        assert!(
+            parse_tool_calls(
+                "<invoke name=\"read\"><parameter name=\"path\">README.md</parameter></invoke>",
+                none.registry()
+            )
+            .is_empty()
+        );
+
+        let required =
+            ToolPolicy::from_request(&tools, Some(&json!("required"))).expect("required");
+        assert!(required.requires_call());
+        let prompt = render_prompt(
+            &[text_message("user", "Use a tool")],
+            required.tools(),
+            required.requires_call(),
+        )
+        .expect("required prompt");
+        assert!(prompt.contains("You must call one or more tools"));
+        assert!(required.validate_calls(&[]).is_err());
+
+        let explicit_choice = json!({
+            "type": "function",
+            "function": {"name": "write"}
+        });
+        let explicit = ToolPolicy::from_request(&tools, Some(&explicit_choice)).expect("explicit");
+        assert_eq!(explicit.tools().len(), 1);
+        assert_eq!(
+            tool_function(&explicit.tools()[0]).unwrap()["name"],
+            "write"
+        );
+        assert!(explicit.requires_call());
+        let explicit_prompt = render_prompt(
+            &[text_message("user", "Use the selected tool")],
+            explicit.tools(),
+            explicit.requires_call(),
+        )
+        .expect("explicit prompt");
+        assert!(explicit_prompt.contains(r#""name": "write""#));
+        assert!(!explicit_prompt.contains(r#""name": "read""#));
+
+        let body = concat!(
+            "<invoke name=\"read\"><parameter name=\"path\">README.md</parameter></invoke>",
+            "<invoke name=\"write\"></invoke>"
+        );
+        let calls = parse_tool_calls(body, explicit.registry());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "write");
+        explicit.validate_calls(&calls).expect("selected call");
+
+        let markers = markers();
+        let mut parser = ChatStreamParser::new(markers, explicit.registry().clone());
+        parser.push(markers.tool_start, TOOL_START.to_owned());
+        let mut streamed = Vec::new();
+        accumulate_tool_deltas(&mut streamed, parser.push(99, body.to_owned()));
+        accumulate_tool_deltas(
+            &mut streamed,
+            parser.push(markers.tool_end, TOOL_END.to_owned()),
+        );
+        assert_eq!(streamed.len(), 1);
+        assert_eq!(streamed[0].name.as_deref(), Some("write"));
+    }
+
+    #[test]
+    fn rejects_unsatisfiable_or_invalid_tool_choices() {
+        assert!(ToolPolicy::from_request(&[], Some(&json!("required"))).is_err());
+
+        let tools = vec![function_tool("read")];
+        let invalid = [
+            json!("any"),
+            json!(7),
+            json!({}),
+            json!({"type": "function"}),
+            json!({"type": "function", "function": {"name": "missing"}}),
+            json!({"type": "custom", "function": {"name": "read"}}),
+        ];
+        for choice in invalid {
+            assert!(
+                ToolPolicy::from_request(&tools, Some(&choice)).is_err(),
+                "accepted invalid tool_choice: {choice}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_tool_set_never_accepts_native_tool_markup() {
+        let policy = ToolPolicy::from_request(&[], None).expect("no tools");
+        let raw = concat!(
+            "</think>",
+            "<minimax:tool_call><invoke name=\"arbitrary\"></invoke>",
+            "</minimax:tool_call>"
+        );
+
+        let parsed = parse_assistant(raw, policy.registry());
+        assert!(parsed.tool_calls.is_empty());
+        assert!(
+            parsed
+                .content
+                .is_some_and(|content| content.contains("arbitrary"))
+        );
+
+        let markers = markers();
+        let mut parser = ChatStreamParser::new(markers, policy.registry().clone());
+        parser.push(markers.tool_start, TOOL_START.to_owned());
+        let mut deltas = parser.push(99, "<invoke name=\"arbitrary\"></invoke>".to_owned());
+        deltas.extend(parser.push(markers.tool_end, TOOL_END.to_owned()));
+        assert!(
+            !deltas
+                .iter()
+                .any(|delta| matches!(delta, StreamDelta::ToolCall(_)))
+        );
     }
 
     #[test]
@@ -1829,7 +2072,7 @@ mod tests {
             text_message("user", "Summarize it"),
         ];
 
-        let prompt = render_prompt(&messages, &[]).expect("render follow-up");
+        let prompt = render_prompt(&messages, &[], false).expect("render follow-up");
         assert!(!prompt.contains("private prior reasoning"));
         assert!(prompt.contains("<invoke name=\"weather\">"));
         assert!(prompt.contains("<parameter name=\"city\">Paris</parameter>"));
@@ -1845,7 +2088,7 @@ mod tests {
         let mut assistant = text_message("assistant", "visible answer");
         assistant.reasoning_content = Some("latest reasoning".to_owned());
 
-        let prompt = render_prompt(&[text_message("user", "Question"), assistant], &[])
+        let prompt = render_prompt(&[text_message("user", "Question"), assistant], &[], false)
             .expect("render assistant turn");
         assert!(
             prompt.contains("]~b]ai\n<think>\nlatest reasoning\n</think>\n\nvisible answer[e~[\n")
@@ -1859,7 +2102,7 @@ mod tests {
             "<think>\nembedded reasoning\n</think>\nvisible answer",
         );
 
-        let prompt = render_prompt(&[text_message("user", "Question"), assistant], &[])
+        let prompt = render_prompt(&[text_message("user", "Question"), assistant], &[], false)
             .expect("render embedded reasoning");
         assert!(
             prompt
@@ -1881,7 +2124,7 @@ mod tests {
             text_message("tool", "result B"),
         ];
 
-        let prompt = render_prompt(&messages, &[]).expect("render tool results");
+        let prompt = render_prompt(&messages, &[], false).expect("render tool results");
         assert_eq!(prompt.matches("]~b]tool").count(), 1);
         assert!(prompt.contains(
             "]~b]tool\n<response>result A</response>\n<response>result B</response>[e~[\n"
@@ -1891,7 +2134,7 @@ mod tests {
     #[test]
     fn rejects_empty_conversations_and_orphan_tool_results() {
         assert!(
-            render_prompt(&[], &[])
+            render_prompt(&[], &[], false)
                 .expect_err("empty conversation")
                 .to_string()
                 .contains("messages must not be empty")
@@ -1899,7 +2142,7 @@ mod tests {
 
         let mut orphan = text_message("tool", "result");
         orphan.tool_call_id = Some("call_missing".to_owned());
-        let error = render_prompt(&[text_message("user", "Hi"), orphan], &[])
+        let error = render_prompt(&[text_message("user", "Hi"), orphan], &[], false)
             .expect_err("orphan tool result");
         assert!(
             error
@@ -1914,7 +2157,7 @@ mod tests {
         let mut assistant = text_message("assistant", "");
         assistant.tool_calls = vec![incoming_call("read", json!("[1, 2]"))];
 
-        let error = render_prompt(&[text_message("user", "Hi"), assistant], &[])
+        let error = render_prompt(&[text_message("user", "Hi"), assistant], &[], false)
             .expect_err("non-object arguments");
         assert!(
             error
