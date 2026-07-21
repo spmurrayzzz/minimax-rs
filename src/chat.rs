@@ -763,14 +763,31 @@ pub fn parse_tool_calls(xml: &str, registry: &ToolRegistry) -> Vec<AssistantTool
 }
 
 pub fn parse_assistant(raw: &str, registry: &ToolRegistry) -> ParsedAssistant {
-    let raw = raw.strip_prefix(THINK_START).unwrap_or(raw);
-    let (reasoning, remainder) = if let Some((reasoning, remainder)) = raw.split_once(THINK_END) {
-        (reasoning.trim_matches('\n'), remainder)
-    } else if let Some(tool_start) = raw.find(TOOL_START) {
-        (raw[..tool_start].trim_matches('\n'), &raw[tool_start..])
+    // llama.cpp's current MiniMax template analysis identifies these exact
+    // wrappers: `<think>\n`, `\n</think>\n\n`, and
+    // `<minimax:tool_call>\n`. Remove at most that fixed whitespace; everything
+    // else belongs to the assistant payload.
+    let raw = if let Some(raw) = raw.strip_prefix(THINK_START) {
+        raw.strip_prefix('\n').unwrap_or(raw)
     } else {
-        (raw.trim_matches('\n'), "")
+        raw
     };
+    let (reasoning, remainder, reasoning_ends_at_tool) =
+        if let Some((reasoning, remainder)) = raw.split_once(THINK_END) {
+            let reasoning = reasoning.strip_suffix('\n').unwrap_or(reasoning);
+            let mut remainder = remainder;
+            for _ in 0..2 {
+                let Some(stripped) = remainder.strip_prefix('\n') else {
+                    break;
+                };
+                remainder = stripped;
+            }
+            (reasoning, remainder, false)
+        } else if let Some(tool_start) = raw.find(TOOL_START) {
+            (&raw[..tool_start], &raw[tool_start..], true)
+        } else {
+            (raw, "", false)
+        };
 
     let mut content = String::new();
     let mut tool_calls = Vec::new();
@@ -790,16 +807,24 @@ pub fn parse_assistant(raw: &str, registry: &ToolRegistry) -> ParsedAssistant {
         if parsed.is_empty() {
             content.push_str(&remainder[start..end + TOOL_END.len()]);
         } else {
+            // A single newline immediately before a valid native tool section
+            // is the section separator emitted by the MiniMax template.
+            if content.ends_with('\n') {
+                content.pop();
+            }
             tool_calls.extend(parsed);
         }
         cursor = end + TOOL_END.len();
     }
     content.push_str(&remainder[cursor..]);
 
-    let reasoning = (!reasoning.is_empty()).then(|| reasoning.to_owned());
-    let content = content.trim_matches('\n').trim().to_owned();
+    let reasoning = if reasoning_ends_at_tool && !tool_calls.is_empty() {
+        reasoning.strip_suffix('\n').unwrap_or(reasoning)
+    } else {
+        reasoning
+    };
     ParsedAssistant {
-        reasoning,
+        reasoning: (!reasoning.is_empty()).then(|| reasoning.to_owned()),
         content: (!content.is_empty()).then_some(content),
         tool_calls,
     }
@@ -1336,6 +1361,9 @@ fn tool_arguments_delta(index: usize, arguments: String) -> StreamDelta {
 pub struct ChatStreamParser {
     markers: MarkerIds,
     mode: StreamMode,
+    prefix_newlines: usize,
+    pending_newline: bool,
+    tool_visible_prefix: Option<StreamMode>,
     tool_buffer: String,
     tool_pending: String,
     tool_state: ToolXmlState,
@@ -1351,6 +1379,9 @@ impl ChatStreamParser {
         Self {
             markers,
             mode: StreamMode::Reasoning,
+            prefix_newlines: 0,
+            pending_newline: false,
+            tool_visible_prefix: None,
             tool_buffer: String::new(),
             tool_pending: String::new(),
             tool_state: ToolXmlState::BetweenInvokes,
@@ -1364,10 +1395,16 @@ impl ChatStreamParser {
 
     pub fn push(&mut self, id: u32, text: String) -> Vec<StreamDelta> {
         if id == self.markers.think_start {
+            self.prefix_newlines = 1;
             return Vec::new();
         }
         if id == self.markers.think_end {
+            // `\n</think>\n\n` is the fixed MiniMax reasoning delimiter.
+            // Hold one reasoning newline until this marker arrives, then consume
+            // at most two content-side newlines before forwarding payload text.
+            self.pending_newline = false;
             self.mode = StreamMode::Content;
+            self.prefix_newlines = 2;
             return Vec::new();
         }
         if id == self.markers.tool_start {
@@ -1381,6 +1418,12 @@ impl ChatStreamParser {
     }
 
     fn start_tool_section(&mut self) {
+        // The template places one newline between payload content and a native
+        // tool section. Delay that one byte so a valid section can consume it;
+        // preserve it if the section later proves invalid or unterminated.
+        self.tool_visible_prefix = self.pending_newline.then_some(self.mode);
+        self.pending_newline = false;
+        self.prefix_newlines = 0;
         self.mode = StreamMode::Tool;
         self.tool_buffer.clear();
         self.tool_pending.clear();
@@ -1388,6 +1431,45 @@ impl ChatStreamParser {
         self.active_invoke = None;
         self.active_parameter = None;
         self.completed_calls.clear();
+    }
+
+    fn payload_delta(mode: StreamMode, text: String) -> StreamDelta {
+        match mode {
+            StreamMode::Reasoning => StreamDelta::Reasoning(text),
+            StreamMode::Content => StreamDelta::Content(text),
+            StreamMode::Tool => unreachable!("tool XML is not assistant payload text"),
+        }
+    }
+
+    fn push_payload_text(&mut self, text: String) -> Vec<StreamDelta> {
+        let mut text = text.as_str();
+        while self.prefix_newlines > 0 {
+            let Some(stripped) = text.strip_prefix('\n') else {
+                if !text.is_empty() {
+                    self.prefix_newlines = 0;
+                }
+                break;
+            };
+            text = stripped;
+            self.prefix_newlines -= 1;
+        }
+
+        let mut output = String::new();
+        if self.pending_newline {
+            output.push('\n');
+            self.pending_newline = false;
+        }
+        if let Some(stripped) = text.strip_suffix('\n') {
+            output.push_str(stripped);
+            self.pending_newline = true;
+        } else {
+            output.push_str(text);
+        }
+        if output.is_empty() {
+            Vec::new()
+        } else {
+            vec![Self::payload_delta(self.mode, output)]
+        }
     }
 
     fn fail_tool_section(&mut self) {
@@ -1650,11 +1732,17 @@ impl ChatStreamParser {
             && self.completed_calls_match(&parsed_calls);
 
         self.mode = StreamMode::Content;
+        self.prefix_newlines = 0;
+        self.pending_newline = false;
         if valid {
+            self.tool_visible_prefix = None;
             for call in &self.completed_calls {
                 deltas.push(tool_arguments_delta(call.index, "}".to_owned()));
             }
         } else {
+            if let Some(mode) = self.tool_visible_prefix.take() {
+                deltas.insert(0, Self::payload_delta(mode, "\n".to_owned()));
+            }
             deltas.push(StreamDelta::Content(format!(
                 "{TOOL_START}{buffered}{TOOL_END}"
             )));
@@ -1675,8 +1763,7 @@ impl ChatStreamParser {
             return Vec::new();
         }
         match self.mode {
-            StreamMode::Reasoning => vec![StreamDelta::Reasoning(text)],
-            StreamMode::Content => vec![StreamDelta::Content(text)],
+            StreamMode::Reasoning | StreamMode::Content => self.push_payload_text(text),
             StreamMode::Tool => {
                 self.tool_buffer.push_str(&text);
                 self.tool_pending.push_str(&text);
@@ -1685,21 +1772,38 @@ impl ChatStreamParser {
         }
     }
 
-    /// Flush an unterminated tool block as visible content. Any speculative
-    /// tool deltas deliberately lack the closing argument-object brace, so an
-    /// invalid or length-limited block cannot reconstruct an executable call.
+    /// Flush delimiter candidates or an unterminated tool block. Any
+    /// speculative tool deltas deliberately lack the closing argument-object
+    /// brace, so an invalid or length-limited block cannot reconstruct an
+    /// executable call.
     pub fn finish(&mut self) -> Vec<StreamDelta> {
-        if self.mode != StreamMode::Tool {
-            return Vec::new();
+        match self.mode {
+            mode @ (StreamMode::Reasoning | StreamMode::Content) => {
+                self.prefix_newlines = 0;
+                if std::mem::take(&mut self.pending_newline) {
+                    vec![Self::payload_delta(mode, "\n".to_owned())]
+                } else {
+                    Vec::new()
+                }
+            }
+            StreamMode::Tool => {
+                self.mode = StreamMode::Content;
+                let buffered = std::mem::take(&mut self.tool_buffer);
+                let mut deltas = self
+                    .tool_visible_prefix
+                    .take()
+                    .map(|mode| Self::payload_delta(mode, "\n".to_owned()))
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                deltas.push(StreamDelta::Content(format!("{TOOL_START}{buffered}")));
+                self.tool_pending.clear();
+                self.active_invoke = None;
+                self.active_parameter = None;
+                self.completed_calls.clear();
+                self.tool_state = ToolXmlState::BetweenInvokes;
+                deltas
+            }
         }
-        self.mode = StreamMode::Content;
-        let buffered = std::mem::take(&mut self.tool_buffer);
-        self.tool_pending.clear();
-        self.active_invoke = None;
-        self.active_parameter = None;
-        self.completed_calls.clear();
-        self.tool_state = ToolXmlState::BetweenInvokes;
-        vec![StreamDelta::Content(format!("{TOOL_START}{buffered}"))]
     }
 }
 
@@ -1856,6 +1960,108 @@ mod tests {
                 call.arguments.push_str(&arguments);
             }
         }
+    }
+
+    #[derive(Default)]
+    struct AccumulatedAssistant {
+        reasoning: String,
+        content: String,
+        tool_calls: Vec<AccumulatedToolCall>,
+    }
+
+    impl AccumulatedAssistant {
+        fn push(&mut self, deltas: impl IntoIterator<Item = StreamDelta>) {
+            for delta in deltas {
+                match delta {
+                    StreamDelta::Reasoning(text) => self.reasoning.push_str(&text),
+                    StreamDelta::Content(text) => self.content.push_str(&text),
+                    StreamDelta::ToolCall(delta) => {
+                        if self.tool_calls.len() <= delta.index {
+                            self.tool_calls
+                                .resize_with(delta.index + 1, AccumulatedToolCall::default);
+                        }
+                        let call = &mut self.tool_calls[delta.index];
+                        if let Some(id) = delta.id {
+                            call.id = Some(id);
+                        }
+                        if let Some(name) = delta.function.name {
+                            call.name = Some(name);
+                        }
+                        if let Some(arguments) = delta.function.arguments {
+                            call.arguments.push_str(&arguments);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn push_stream_text(
+        parser: &mut ChatStreamParser,
+        accumulated: &mut AccumulatedAssistant,
+        text: &str,
+    ) {
+        for character in text.chars() {
+            accumulated.push(parser.push(99, character.to_string()));
+        }
+    }
+
+    fn stream_assistant(raw: &str, registry: &ToolRegistry) -> AccumulatedAssistant {
+        let markers = markers();
+        let marker_text = [
+            (THINK_START, markers.think_start),
+            (THINK_END, markers.think_end),
+            (TOOL_START, markers.tool_start),
+            (TOOL_END, markers.tool_end),
+        ];
+        let mut parser = ChatStreamParser::new(markers, registry.clone());
+        let mut accumulated = AccumulatedAssistant::default();
+        let mut cursor = 0;
+        while cursor < raw.len() {
+            let next = marker_text
+                .iter()
+                .filter_map(|(marker, id)| {
+                    raw[cursor..]
+                        .find(marker)
+                        .map(|offset| (cursor + offset, *id, *marker))
+                })
+                .min_by_key(|(offset, _, _)| *offset);
+            let Some((offset, id, marker)) = next else {
+                push_stream_text(&mut parser, &mut accumulated, &raw[cursor..]);
+                break;
+            };
+            if cursor < offset {
+                push_stream_text(&mut parser, &mut accumulated, &raw[cursor..offset]);
+            }
+            accumulated.push(parser.push(id, marker.to_owned()));
+            cursor = offset + marker.len();
+        }
+        accumulated.push(parser.finish());
+        accumulated
+    }
+
+    fn assert_stream_matches_complete(raw: &str, registry: &ToolRegistry) -> ParsedAssistant {
+        let complete = parse_assistant(raw, registry);
+        let streamed = stream_assistant(raw, registry);
+        assert_eq!(
+            streamed.reasoning,
+            complete.reasoning.clone().unwrap_or_default(),
+            "reasoning differed for {raw:?}"
+        );
+        assert_eq!(
+            streamed.content,
+            complete.content.clone().unwrap_or_default(),
+            "content differed for {raw:?}"
+        );
+        assert_eq!(streamed.tool_calls.len(), complete.tool_calls.len());
+        for (streamed, complete) in streamed.tool_calls.iter().zip(&complete.tool_calls) {
+            assert_eq!(
+                streamed.name.as_deref(),
+                Some(complete.function.name.as_str())
+            );
+            assert_eq!(streamed.arguments, complete.function.arguments);
+        }
+        complete
     }
 
     fn markers() -> MarkerIds {
@@ -2269,6 +2475,65 @@ mod tests {
     }
 
     #[test]
+    fn preserves_payload_whitespace_after_fixed_protocol_delimiters() {
+        let registry = registry(&[]);
+        let fixtures = [
+            (
+                "plan\n</think>\n\n  leading spaces",
+                Some("plan"),
+                Some("  leading spaces"),
+            ),
+            (
+                "  plan with a payload newline\n\n</think>\n\nanswer with trailing newlines\n\n",
+                Some("  plan with a payload newline\n"),
+                Some("answer with trailing newlines\n\n"),
+            ),
+            (
+                concat!(
+                    "<think>\n  inspect\n</think>\n\n",
+                    "```rust\n",
+                    "fn main() {\n",
+                    "    println!(\"hello\");\n",
+                    "}\n",
+                    "```\n"
+                ),
+                Some("  inspect"),
+                Some("```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n"),
+            ),
+        ];
+
+        for (raw, reasoning, content) in fixtures {
+            let parsed = assert_stream_matches_complete(raw, &registry);
+            assert_eq!(parsed.reasoning.as_deref(), reasoning);
+            assert_eq!(parsed.content.as_deref(), content);
+            assert!(parsed.tool_calls.is_empty());
+        }
+    }
+
+    #[test]
+    fn tool_only_protocol_whitespace_is_not_visible_content() {
+        let registry = registry(&[function_tool("read")]);
+        let raw = concat!(
+            "\n</think>\n\n",
+            "<minimax:tool_call>\n",
+            "<invoke name=\"read\">\n",
+            "<parameter name=\"path\">README.md</parameter>\n",
+            "</invoke>\n",
+            "</minimax:tool_call>"
+        );
+
+        let parsed = assert_stream_matches_complete(raw, &registry);
+        assert_eq!(parsed.reasoning, None);
+        assert_eq!(parsed.content, None);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].function.name, "read");
+        assert_eq!(
+            parsed_arguments(&parsed.tool_calls[0]),
+            json!({"path": "README.md"})
+        );
+    }
+
+    #[test]
     fn parses_reasoning_visible_content_and_tool_calls_separately() {
         let raw = concat!(
             "<think>\nInspect first.\n</think>\n",
@@ -2299,7 +2564,7 @@ mod tests {
         );
         let registry = registry(&[empty_function_tool("read")]);
 
-        let parsed = parse_assistant(raw, &registry);
+        let parsed = assert_stream_matches_complete(raw, &registry);
         assert_eq!(parsed.reasoning.as_deref(), Some("Need the file."));
         assert_eq!(parsed.content, None);
         assert_eq!(parsed.tool_calls.len(), 1);

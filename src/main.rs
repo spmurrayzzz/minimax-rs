@@ -884,6 +884,16 @@ fn finish_reason(generation: &GenerationResult, has_tool_calls: bool) -> &'stati
     }
 }
 
+fn openai_chat_stream_delta(delta: chat::StreamDelta) -> (serde_json::Value, bool) {
+    match delta {
+        chat::StreamDelta::Reasoning(reasoning) => {
+            (serde_json::json!({"reasoning_content": reasoning}), false)
+        }
+        chat::StreamDelta::Content(content) => (serde_json::json!({"content": content}), false),
+        chat::StreamDelta::ToolCall(call) => (serde_json::json!({"tool_calls": [call]}), true),
+    }
+}
+
 fn sse(value: &serde_json::Value) -> String {
     format!("data: {value}\n\n")
 }
@@ -1132,18 +1142,8 @@ async fn chat_completions(
                             None => parser.push_text(generated.text),
                         };
                         for delta in parsed_deltas {
-                            let delta = match delta {
-                                chat::StreamDelta::Reasoning(reasoning) => {
-                                    serde_json::json!({"reasoning_content": reasoning})
-                                }
-                                chat::StreamDelta::Content(content) => {
-                                    serde_json::json!({"content": content})
-                                }
-                                chat::StreamDelta::ToolCall(call) => {
-                                    streamed_tool_calls = true;
-                                    serde_json::json!({"tool_calls": [call]})
-                                }
-                            };
+                            let (delta, has_tool_call) = openai_chat_stream_delta(delta);
+                            streamed_tool_calls |= has_tool_call;
                             if !send_sse(
                                 &token_sender,
                                 serde_json::json!({
@@ -1167,22 +1167,22 @@ async fn chat_completions(
             match generation {
                 Ok(generation) => 'complete: {
                     for delta in parser.finish() {
-                        if let chat::StreamDelta::Content(content) = delta {
-                            let _ = send_sse(
-                                &sender,
-                                serde_json::json!({
-                                    "id": id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created,
-                                    "model": model_name,
-                                    "choices": [{
-                                        "index": 0,
-                                        "delta": {"content": content},
-                                        "finish_reason": null
-                                    }]
-                                }),
-                            );
-                        }
+                        let (delta, has_tool_call) = openai_chat_stream_delta(delta);
+                        streamed_tool_calls |= has_tool_call;
+                        let _ = send_sse(
+                            &sender,
+                            serde_json::json!({
+                                "id": id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": delta,
+                                    "finish_reason": null
+                                }]
+                            }),
+                        );
                     }
                     let parsed = chat::parse_assistant(&generation.text, tool_policy.registry());
                     if let Err(error) = tool_policy.validate_calls(&parsed.tool_calls) {
@@ -1792,6 +1792,29 @@ mod tests {
             };
             assert_eq!(finish_reason(&generation, false), "stop");
         }
+    }
+
+    #[test]
+    fn final_reasoning_delta_keeps_its_openai_field() {
+        let mut parser = chat::ChatStreamParser::new(
+            chat::MarkerIds {
+                think_start: 10,
+                think_end: 11,
+                tool_start: 12,
+                tool_end: 13,
+            },
+            chat::ToolRegistry::default(),
+        );
+        assert!(matches!(
+            parser.push_text("reasoning\n".to_owned()).as_slice(),
+            [chat::StreamDelta::Reasoning(reasoning)] if reasoning == "reasoning"
+        ));
+        let mut trailing = parser.finish();
+        assert_eq!(trailing.len(), 1);
+        let (delta, has_tool_call) = openai_chat_stream_delta(trailing.remove(0));
+
+        assert_eq!(delta, json!({"reasoning_content": "\n"}));
+        assert!(!has_tool_call);
     }
 
     #[test]
