@@ -1087,21 +1087,9 @@ async fn chat_completions(
                                 chat::StreamDelta::Content(content) => {
                                     serde_json::json!({"content": content})
                                 }
-                                chat::StreamDelta::ToolCalls(calls) => {
+                                chat::StreamDelta::ToolCall(call) => {
                                     streamed_tool_calls = true;
-                                    let calls = calls
-                                        .into_iter()
-                                        .enumerate()
-                                        .map(|(index, call)| {
-                                            serde_json::json!({
-                                                "index": index,
-                                                "id": call.id,
-                                                "type": call.r#type,
-                                                "function": call.function
-                                            })
-                                        })
-                                        .collect::<Vec<_>>();
-                                    serde_json::json!({"tool_calls": calls})
+                                    serde_json::json!({"tool_calls": [call]})
                                 }
                             };
                             if !send_sse(

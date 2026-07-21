@@ -516,6 +516,10 @@ fn additional_property_schema<'a>(
     None
 }
 
+fn raw_starts_structured_json(raw: &str) -> bool {
+    matches!(raw.trim_start().chars().next(), Some('{' | '[' | '"'))
+}
+
 fn decode_parameter(definition: &ToolDefinition, name: &str, raw: &str) -> Option<Value> {
     let parameter_schema = declared_property_schema(
         &definition.parameters,
@@ -537,8 +541,7 @@ fn decode_parameter(definition: &ToolDefinition, name: &str, raw: &str) -> Optio
         return Some(Value::String(raw.to_owned()));
     }
     serde_json::from_str(raw).ok().or_else(|| {
-        parameter_schema
-            .is_none()
+        (parameter_schema.is_none() && !raw_starts_structured_json(raw))
             .then(|| Value::String(raw.to_owned()))
     })
 }
@@ -557,6 +560,9 @@ fn parse_invoke(
     let definition = registry.definitions.get(&name)?;
     let body = invoke.get(4).map_or("", |capture| capture.as_str());
     let mut arguments = Map::new();
+    // Preserve source parameter order and JSON spelling so concatenated stream
+    // fragments reconstruct the same arguments string as the complete parser.
+    let mut encoded_arguments = String::from("{");
     let mut cursor = 0;
     for parameter in parameter_regex().captures_iter(body) {
         let whole_parameter = parameter.get(0)?;
@@ -574,15 +580,31 @@ fn parse_invoke(
             return None;
         }
         let raw = parameter.get(4).map_or("", |capture| capture.as_str());
-        arguments.insert(
-            parameter_name.to_owned(),
-            decode_parameter(definition, parameter_name, raw)?,
+        let value = decode_parameter(definition, parameter_name, raw)?;
+        if !arguments.is_empty() {
+            encoded_arguments.push(',');
+        }
+        encoded_arguments.push_str(
+            &serde_json::to_string(parameter_name)
+                .expect("serializing a parameter name cannot fail"),
         );
+        encoded_arguments.push(':');
+        match parameter_encoding(definition, parameter_name) {
+            ParameterEncoding::String => encoded_arguments
+                .push_str(&serde_json::to_string(raw).expect("serializing a string cannot fail")),
+            ParameterEncoding::Json => encoded_arguments.push_str(raw),
+            ParameterEncoding::Deferred if raw_starts_structured_json(raw) => {
+                encoded_arguments.push_str(raw)
+            }
+            ParameterEncoding::Deferred => encoded_arguments.push_str(&value.to_string()),
+        }
+        arguments.insert(parameter_name.to_owned(), value);
     }
     if !body[cursor..].trim().is_empty() {
         return None;
     }
 
+    encoded_arguments.push('}');
     let arguments = Value::Object(arguments);
     if !definition.validator.is_valid(&arguments) {
         return None;
@@ -592,7 +614,7 @@ fn parse_invoke(
         r#type: "function",
         function: AssistantFunctionCall {
             name,
-            arguments: arguments.to_string(),
+            arguments: encoded_arguments,
         },
     })
 }
@@ -671,11 +693,29 @@ pub struct MarkerIds {
     pub tool_end: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AssistantToolCallDelta {
+    pub index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<&'static str>,
+    pub function: AssistantFunctionCallDelta,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AssistantFunctionCallDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamDelta {
     Reasoning(String),
     Content(String),
-    ToolCalls(Vec<AssistantToolCall>),
+    ToolCall(AssistantToolCallDelta),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -685,10 +725,504 @@ enum StreamMode {
     Tool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolXmlState {
+    BetweenInvokes,
+    BetweenParameters,
+    ParameterValue,
+    UnknownInvoke,
+    InvalidInvoke,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParameterEncoding {
+    String,
+    Json,
+    Deferred,
+}
+
+#[derive(Debug)]
+enum ParameterStreamState {
+    EscapedString,
+    JsonPending(String),
+    JsonStructured(JsonBoundary),
+    JsonScalar,
+    DeferredPending(String),
+    DeferredString,
+    DeferredStructured(JsonBoundary),
+    Invalid,
+}
+
+#[derive(Debug, Default)]
+struct JsonBoundary {
+    stack: Vec<char>,
+    started: bool,
+    root_string: bool,
+    in_string: bool,
+    escaped: bool,
+    complete: bool,
+}
+
+impl JsonBoundary {
+    fn push(&mut self, text: &str) -> Option<String> {
+        let mut safe_end = 0;
+        for (index, character) in text.char_indices() {
+            let end = index + character.len_utf8();
+            if self.complete {
+                if character.is_whitespace() {
+                    safe_end = end;
+                    continue;
+                }
+                return None;
+            }
+            if !self.started {
+                if character.is_whitespace() {
+                    safe_end = end;
+                    continue;
+                }
+                self.started = true;
+                match character {
+                    '{' | '[' => self.stack.push(character),
+                    '"' => {
+                        self.root_string = true;
+                        self.in_string = true;
+                    }
+                    _ => return None,
+                }
+                safe_end = end;
+                continue;
+            }
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                } else {
+                    match character {
+                        '\\' => self.escaped = true,
+                        '"' => {
+                            self.in_string = false;
+                            if self.root_string && self.stack.is_empty() {
+                                self.complete = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                safe_end = end;
+                continue;
+            }
+            match character {
+                '"' => self.in_string = true,
+                '{' | '[' => self.stack.push(character),
+                '}' => {
+                    if self.stack.pop() != Some('{') {
+                        return None;
+                    }
+                    if self.stack.is_empty() {
+                        self.complete = true;
+                    }
+                }
+                ']' => {
+                    if self.stack.pop() != Some('[') {
+                        return None;
+                    }
+                    if self.stack.is_empty() {
+                        self.complete = true;
+                    }
+                }
+                _ => {}
+            }
+            safe_end = end;
+        }
+        Some(text[..safe_end].to_owned())
+    }
+
+    fn is_complete(&self) -> bool {
+        self.complete && !self.in_string && self.stack.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferredClassification {
+    Pending,
+    String,
+    Structured,
+}
+
+fn could_be_json_number_prefix(text: &str) -> bool {
+    let text = text.trim_start();
+    let value_end = text.find(char::is_whitespace).unwrap_or(text.len());
+    if !text[value_end..].chars().all(char::is_whitespace) {
+        return false;
+    }
+    let bytes = &text.as_bytes()[..value_end];
+    let mut index = 0;
+    if bytes.get(index) == Some(&b'-') {
+        index += 1;
+    }
+    let Some(&first) = bytes.get(index) else {
+        return true;
+    };
+    if first == b'0' {
+        index += 1;
+    } else if first.is_ascii_digit() && first != b'0' {
+        index += 1;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+    } else {
+        return false;
+    }
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if index == bytes.len() {
+            return true;
+        }
+    }
+    if matches!(bytes.get(index), Some(b'e' | b'E')) {
+        index += 1;
+        if matches!(bytes.get(index), Some(b'+' | b'-')) {
+            index += 1;
+        }
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+    }
+    index == bytes.len()
+}
+
+fn classify_deferred(raw: &str) -> DeferredClassification {
+    let trimmed = raw.trim_start();
+    let Some(first) = trimmed.chars().next() else {
+        return DeferredClassification::Pending;
+    };
+    if matches!(first, '{' | '[' | '"') {
+        return DeferredClassification::Structured;
+    }
+    if serde_json::from_str::<Value>(trimmed)
+        .is_ok_and(|value| !matches!(value, Value::Array(_) | Value::Object(_) | Value::String(_)))
+    {
+        return DeferredClassification::Pending;
+    }
+    let literal_prefix = match first {
+        't' => "true".starts_with(trimmed),
+        'f' => "false".starts_with(trimmed),
+        'n' => "null".starts_with(trimmed),
+        '-' | '0'..='9' => could_be_json_number_prefix(trimmed),
+        _ => false,
+    };
+    if literal_prefix {
+        DeferredClassification::Pending
+    } else {
+        DeferredClassification::String
+    }
+}
+
+impl ParameterStreamState {
+    fn new(encoding: ParameterEncoding) -> Self {
+        match encoding {
+            ParameterEncoding::String => Self::EscapedString,
+            ParameterEncoding::Json => Self::JsonPending(String::new()),
+            ParameterEncoding::Deferred => Self::DeferredPending(String::new()),
+        }
+    }
+
+    fn opens_string(&self) -> bool {
+        matches!(self, Self::EscapedString)
+    }
+
+    fn push(&mut self, text: &str) -> Option<String> {
+        let state = std::mem::replace(self, Self::Invalid);
+        match state {
+            Self::EscapedString => {
+                *self = Self::EscapedString;
+                Some(escaped_json_string_fragment(text))
+            }
+            Self::JsonPending(mut pending) => {
+                pending.push_str(text);
+                match pending.trim_start().chars().next() {
+                    None => {
+                        *self = Self::JsonPending(pending);
+                        Some(String::new())
+                    }
+                    Some('{' | '[' | '"') => {
+                        let mut boundary = JsonBoundary::default();
+                        let output = boundary.push(&pending)?;
+                        *self = Self::JsonStructured(boundary);
+                        Some(output)
+                    }
+                    Some(_) => {
+                        *self = Self::JsonScalar;
+                        Some(String::new())
+                    }
+                }
+            }
+            Self::JsonStructured(mut boundary) => {
+                let output = boundary.push(text)?;
+                *self = Self::JsonStructured(boundary);
+                Some(output)
+            }
+            Self::JsonScalar => {
+                *self = Self::JsonScalar;
+                Some(String::new())
+            }
+            Self::DeferredPending(mut pending) => {
+                pending.push_str(text);
+                match classify_deferred(&pending) {
+                    DeferredClassification::Pending => {
+                        *self = Self::DeferredPending(pending);
+                        Some(String::new())
+                    }
+                    DeferredClassification::String => {
+                        let output = format!("\"{}", escaped_json_string_fragment(&pending));
+                        *self = Self::DeferredString;
+                        Some(output)
+                    }
+                    DeferredClassification::Structured => {
+                        let mut boundary = JsonBoundary::default();
+                        let output = boundary.push(&pending)?;
+                        *self = Self::DeferredStructured(boundary);
+                        Some(output)
+                    }
+                }
+            }
+            Self::DeferredString => {
+                *self = Self::DeferredString;
+                Some(escaped_json_string_fragment(text))
+            }
+            Self::DeferredStructured(mut boundary) => {
+                let output = boundary.push(text)?;
+                *self = Self::DeferredStructured(boundary);
+                Some(output)
+            }
+            Self::Invalid => None,
+        }
+    }
+
+    fn finish(&self, raw: &str, value: &Value) -> Option<String> {
+        match self {
+            Self::EscapedString | Self::DeferredString => Some("\"".to_owned()),
+            Self::JsonPending(_) | Self::JsonScalar => Some(raw.to_owned()),
+            Self::JsonStructured(boundary) | Self::DeferredStructured(boundary)
+                if boundary.is_complete() =>
+            {
+                Some(String::new())
+            }
+            Self::DeferredPending(_) => Some(value.to_string()),
+            Self::JsonStructured(_) | Self::DeferredStructured(_) | Self::Invalid => None,
+        }
+    }
+}
+
+struct StreamingParameter {
+    name: String,
+    raw: String,
+    stream: ParameterStreamState,
+}
+
+struct StreamingInvoke {
+    index: usize,
+    name: String,
+    arguments: Map<String, Value>,
+    parameter_names: HashSet<String>,
+    parameter_count: usize,
+}
+
+struct CompletedStreamingCall {
+    index: usize,
+    name: String,
+    arguments: Value,
+}
+
+fn find_tag_end(text: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut awaiting_value = false;
+    let mut unquoted_value = false;
+    for (index, character) in text.char_indices() {
+        if let Some(expected) = quote {
+            if character == expected {
+                quote = None;
+            }
+            continue;
+        }
+        if unquoted_value {
+            if character == '>' {
+                return Some(index);
+            }
+            continue;
+        }
+        if awaiting_value {
+            if character.is_whitespace() {
+                continue;
+            }
+            awaiting_value = false;
+            if matches!(character, '"' | '\'') {
+                quote = Some(character);
+            } else if character == '>' {
+                return Some(index);
+            } else {
+                unquoted_value = true;
+            }
+            continue;
+        }
+        match character {
+            '=' => awaiting_value = true,
+            '>' => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn invoke_open_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r#"(?s)^<\s*invoke\s+name\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^>\s]+))\s*>$"#)
+            .unwrap()
+    })
+}
+
+fn parameter_open_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r#"(?s)^<\s*parameter\s+name\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^>\s]+))\s*>$"#)
+            .unwrap()
+    })
+}
+
+fn invoke_close_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?s)<\s*/\s*invoke\s*>").unwrap())
+}
+
+fn invoke_close_tag_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?s)^<\s*/\s*invoke\s*>$").unwrap())
+}
+
+fn parameter_close_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?s)<\s*/\s*parameter\s*>").unwrap())
+}
+
+fn capture_name(captures: &regex::Captures<'_>) -> Option<String> {
+    captures
+        .get(1)
+        .or_else(|| captures.get(2))
+        .or_else(|| captures.get(3))
+        .map(|capture| capture.as_str().trim().to_owned())
+}
+
+fn leading_whitespace_len(text: &str) -> usize {
+    text.char_indices()
+        .find_map(|(index, character)| (!character.is_whitespace()).then_some(index))
+        .unwrap_or(text.len())
+}
+
+fn possible_close_tag_prefix(text: &str, name: &str) -> bool {
+    let mut characters = text.chars();
+    if characters.next() != Some('<') {
+        return false;
+    }
+    let mut next = characters.next();
+    while next.is_some_and(char::is_whitespace) {
+        next = characters.next();
+    }
+    let Some('/') = next else {
+        return next.is_none();
+    };
+    next = characters.next();
+    while next.is_some_and(char::is_whitespace) {
+        next = characters.next();
+    }
+    for expected in name.chars() {
+        match next {
+            Some(actual) if actual == expected => next = characters.next(),
+            None => return true,
+            _ => return false,
+        }
+    }
+    while next.is_some_and(char::is_whitespace) {
+        next = characters.next();
+    }
+    next.is_none()
+}
+
+fn safe_text_before_close_prefix(text: &str, name: &str) -> usize {
+    text.char_indices()
+        .find_map(|(index, character)| {
+            (character == '<' && possible_close_tag_prefix(&text[index..], name)).then_some(index)
+        })
+        .unwrap_or(text.len())
+}
+
+fn escaped_json_string_fragment(text: &str) -> String {
+    let encoded = serde_json::to_string(text).expect("serializing a string cannot fail");
+    encoded[1..encoded.len() - 1].to_owned()
+}
+
+fn parameter_encoding(definition: &ToolDefinition, name: &str) -> ParameterEncoding {
+    let schema = declared_property_schema(
+        &definition.parameters,
+        &definition.parameters,
+        name,
+        &mut HashSet::new(),
+    )
+    .or_else(|| {
+        additional_property_schema(
+            &definition.parameters,
+            &definition.parameters,
+            &mut HashSet::new(),
+        )
+    });
+    match schema {
+        Some(schema)
+            if schema_resolves_to_string(&definition.parameters, schema, &mut HashSet::new()) =>
+        {
+            ParameterEncoding::String
+        }
+        Some(_) => ParameterEncoding::Json,
+        None => ParameterEncoding::Deferred,
+    }
+}
+
+fn tool_call_header(index: usize, name: String) -> StreamDelta {
+    StreamDelta::ToolCall(AssistantToolCallDelta {
+        index,
+        id: Some(format!("call_{}", Uuid::new_v4().simple())),
+        r#type: Some("function"),
+        function: AssistantFunctionCallDelta {
+            name: Some(name),
+            arguments: Some("{".to_owned()),
+        },
+    })
+}
+
+fn tool_arguments_delta(index: usize, arguments: String) -> StreamDelta {
+    StreamDelta::ToolCall(AssistantToolCallDelta {
+        index,
+        id: None,
+        r#type: None,
+        function: AssistantFunctionCallDelta {
+            name: None,
+            arguments: Some(arguments),
+        },
+    })
+}
+
 pub struct ChatStreamParser {
     markers: MarkerIds,
     mode: StreamMode,
     tool_buffer: String,
+    tool_pending: String,
+    tool_state: ToolXmlState,
+    active_invoke: Option<StreamingInvoke>,
+    active_parameter: Option<StreamingParameter>,
+    completed_calls: Vec<CompletedStreamingCall>,
+    next_tool_index: usize,
     registry: ToolRegistry,
 }
 
@@ -698,6 +1232,12 @@ impl ChatStreamParser {
             markers,
             mode: StreamMode::Reasoning,
             tool_buffer: String::new(),
+            tool_pending: String::new(),
+            tool_state: ToolXmlState::BetweenInvokes,
+            active_invoke: None,
+            active_parameter: None,
+            completed_calls: Vec::new(),
+            next_tool_index: 0,
             registry,
         }
     }
@@ -711,23 +1251,300 @@ impl ChatStreamParser {
             return Vec::new();
         }
         if id == self.markers.tool_start {
-            self.mode = StreamMode::Tool;
-            self.tool_buffer.clear();
+            self.start_tool_section();
             return Vec::new();
         }
         if id == self.markers.tool_end {
-            let buffered = std::mem::take(&mut self.tool_buffer);
-            let calls = parse_tool_calls(&buffered, &self.registry);
-            self.mode = StreamMode::Content;
-            return if calls.is_empty() {
-                vec![StreamDelta::Content(format!(
-                    "{TOOL_START}{buffered}{TOOL_END}"
-                ))]
-            } else {
-                vec![StreamDelta::ToolCalls(calls)]
-            };
+            return self.close_tool_section();
         }
         self.push_text(text)
+    }
+
+    fn start_tool_section(&mut self) {
+        self.mode = StreamMode::Tool;
+        self.tool_buffer.clear();
+        self.tool_pending.clear();
+        self.tool_state = ToolXmlState::BetweenInvokes;
+        self.active_invoke = None;
+        self.active_parameter = None;
+        self.completed_calls.clear();
+    }
+
+    fn fail_tool_section(&mut self) {
+        self.tool_state = ToolXmlState::Failed;
+        self.active_invoke = None;
+        self.active_parameter = None;
+        self.tool_pending.clear();
+    }
+
+    fn reject_active_invoke(&mut self) {
+        self.tool_state = ToolXmlState::InvalidInvoke;
+        self.active_invoke = None;
+        self.active_parameter = None;
+    }
+
+    fn process_tool_text(&mut self) -> Vec<StreamDelta> {
+        let mut deltas = Vec::new();
+        loop {
+            match self.tool_state {
+                ToolXmlState::BetweenInvokes => {
+                    let whitespace = leading_whitespace_len(&self.tool_pending);
+                    self.tool_pending.drain(..whitespace);
+                    if self.tool_pending.is_empty() {
+                        break;
+                    }
+                    let Some(tag_end) = find_tag_end(&self.tool_pending) else {
+                        break;
+                    };
+                    let tag = self.tool_pending[..=tag_end].to_owned();
+                    let Some(name) = invoke_open_regex()
+                        .captures(&tag)
+                        .and_then(|captures| capture_name(&captures))
+                        .filter(|name| !name.is_empty())
+                    else {
+                        self.fail_tool_section();
+                        break;
+                    };
+                    self.tool_pending.drain(..=tag_end);
+                    if self.registry.definitions.contains_key(&name) {
+                        let index = self.next_tool_index;
+                        self.next_tool_index += 1;
+                        self.active_invoke = Some(StreamingInvoke {
+                            index,
+                            name: name.clone(),
+                            arguments: Map::new(),
+                            parameter_names: HashSet::new(),
+                            parameter_count: 0,
+                        });
+                        self.tool_state = ToolXmlState::BetweenParameters;
+                        deltas.push(tool_call_header(index, name));
+                    } else {
+                        self.tool_state = ToolXmlState::UnknownInvoke;
+                    }
+                }
+                ToolXmlState::BetweenParameters => {
+                    let whitespace = leading_whitespace_len(&self.tool_pending);
+                    self.tool_pending.drain(..whitespace);
+                    if self.tool_pending.is_empty() {
+                        break;
+                    }
+                    let Some(tag_end) = find_tag_end(&self.tool_pending) else {
+                        break;
+                    };
+                    let tag = self.tool_pending[..=tag_end].to_owned();
+                    if invoke_close_tag_regex().is_match(&tag) {
+                        self.tool_pending.drain(..=tag_end);
+                        let Some(invoke) = self.active_invoke.take() else {
+                            self.fail_tool_section();
+                            break;
+                        };
+                        let arguments = Value::Object(invoke.arguments);
+                        let Some(definition) = self.registry.definitions.get(&invoke.name) else {
+                            self.fail_tool_section();
+                            break;
+                        };
+                        if !definition.validator.is_valid(&arguments) {
+                            self.tool_state = ToolXmlState::BetweenInvokes;
+                            continue;
+                        }
+                        self.completed_calls.push(CompletedStreamingCall {
+                            index: invoke.index,
+                            name: invoke.name,
+                            arguments,
+                        });
+                        self.tool_state = ToolXmlState::BetweenInvokes;
+                        continue;
+                    }
+
+                    let Some(parameter_name) = parameter_open_regex()
+                        .captures(&tag)
+                        .and_then(|captures| capture_name(&captures))
+                        .filter(|name| !name.is_empty())
+                    else {
+                        self.reject_active_invoke();
+                        continue;
+                    };
+                    let Some(invoke) = self.active_invoke.as_mut() else {
+                        self.fail_tool_section();
+                        break;
+                    };
+                    if !invoke.parameter_names.insert(parameter_name.clone()) {
+                        self.reject_active_invoke();
+                        continue;
+                    }
+                    let Some(definition) = self.registry.definitions.get(&invoke.name) else {
+                        self.fail_tool_section();
+                        break;
+                    };
+                    let encoding = parameter_encoding(definition, &parameter_name);
+                    let stream = ParameterStreamState::new(encoding);
+                    let mut arguments = String::new();
+                    if invoke.parameter_count > 0 {
+                        arguments.push(',');
+                    }
+                    arguments.push_str(
+                        &serde_json::to_string(&parameter_name)
+                            .expect("serializing a parameter name cannot fail"),
+                    );
+                    arguments.push(':');
+                    if stream.opens_string() {
+                        arguments.push('"');
+                    }
+                    invoke.parameter_count += 1;
+                    let index = invoke.index;
+                    self.active_parameter = Some(StreamingParameter {
+                        name: parameter_name,
+                        raw: String::new(),
+                        stream,
+                    });
+                    self.tool_pending.drain(..=tag_end);
+                    self.tool_state = ToolXmlState::ParameterValue;
+                    deltas.push(tool_arguments_delta(index, arguments));
+                }
+                ToolXmlState::ParameterValue => {
+                    if let Some((value_end, close_end)) = parameter_close_regex()
+                        .find(&self.tool_pending)
+                        .map(|close| (close.start(), close.end()))
+                    {
+                        let value_text = self.tool_pending[..value_end].to_owned();
+                        let stream_valid = self.stream_parameter_text(&value_text, &mut deltas);
+                        self.tool_pending.drain(..close_end);
+                        if !stream_valid {
+                            self.reject_active_invoke();
+                            continue;
+                        }
+
+                        let Some(parameter) = self.active_parameter.take() else {
+                            self.fail_tool_section();
+                            break;
+                        };
+                        let Some((index, invoke_name)) = self
+                            .active_invoke
+                            .as_ref()
+                            .map(|invoke| (invoke.index, invoke.name.clone()))
+                        else {
+                            self.fail_tool_section();
+                            break;
+                        };
+                        let Some(definition) = self.registry.definitions.get(&invoke_name) else {
+                            self.fail_tool_section();
+                            break;
+                        };
+                        let Some(value) =
+                            decode_parameter(definition, &parameter.name, &parameter.raw)
+                        else {
+                            self.reject_active_invoke();
+                            continue;
+                        };
+                        let Some(suffix) = parameter.stream.finish(&parameter.raw, &value) else {
+                            self.reject_active_invoke();
+                            continue;
+                        };
+                        self.active_invoke
+                            .as_mut()
+                            .expect("active invoke was checked above")
+                            .arguments
+                            .insert(parameter.name, value);
+                        self.tool_state = ToolXmlState::BetweenParameters;
+                        if !suffix.is_empty() {
+                            deltas.push(tool_arguments_delta(index, suffix));
+                        }
+                        continue;
+                    }
+
+                    let safe = safe_text_before_close_prefix(&self.tool_pending, "parameter");
+                    if safe == 0 {
+                        break;
+                    }
+                    let value_text = self.tool_pending[..safe].to_owned();
+                    self.tool_pending.drain(..safe);
+                    if !self.stream_parameter_text(&value_text, &mut deltas) {
+                        self.reject_active_invoke();
+                    }
+                }
+                ToolXmlState::UnknownInvoke | ToolXmlState::InvalidInvoke => {
+                    if let Some(close) = invoke_close_regex().find(&self.tool_pending) {
+                        let close_end = close.end();
+                        self.tool_pending.drain(..close_end);
+                        self.tool_state = ToolXmlState::BetweenInvokes;
+                        continue;
+                    }
+                    let safe = safe_text_before_close_prefix(&self.tool_pending, "invoke");
+                    if safe == 0 {
+                        break;
+                    }
+                    self.tool_pending.drain(..safe);
+                }
+                ToolXmlState::Failed => {
+                    self.tool_pending.clear();
+                    break;
+                }
+            }
+        }
+        deltas
+    }
+
+    fn stream_parameter_text(&mut self, text: &str, deltas: &mut Vec<StreamDelta>) -> bool {
+        let Some(index) = self.active_invoke.as_ref().map(|invoke| invoke.index) else {
+            self.fail_tool_section();
+            return false;
+        };
+        let Some(parameter) = self.active_parameter.as_mut() else {
+            self.fail_tool_section();
+            return false;
+        };
+        parameter.raw.push_str(text);
+        let Some(output) = parameter.stream.push(text) else {
+            return false;
+        };
+        if !output.is_empty() {
+            deltas.push(tool_arguments_delta(index, output));
+        }
+        true
+    }
+
+    fn completed_calls_match(&self, calls: &[AssistantToolCall]) -> bool {
+        calls.len() == self.completed_calls.len()
+            && calls
+                .iter()
+                .zip(&self.completed_calls)
+                .all(|(call, streamed)| {
+                    call.function.name == streamed.name
+                        && serde_json::from_str::<Value>(&call.function.arguments)
+                            .is_ok_and(|arguments| arguments == streamed.arguments)
+                })
+    }
+
+    fn close_tool_section(&mut self) -> Vec<StreamDelta> {
+        let mut deltas = self.process_tool_text();
+        let buffered = std::mem::take(&mut self.tool_buffer);
+        let parsed_calls = parse_tool_calls(&buffered, &self.registry);
+        // The complete parser remains the final schema/markup authority. Keep
+        // every streamed object open until this succeeds, so malformed output
+        // can never reconstruct a complete executable arguments object.
+        let valid = self.tool_state == ToolXmlState::BetweenInvokes
+            && self.tool_pending.is_empty()
+            && self.active_invoke.is_none()
+            && self.active_parameter.is_none()
+            && !parsed_calls.is_empty()
+            && self.completed_calls_match(&parsed_calls);
+
+        self.mode = StreamMode::Content;
+        if valid {
+            for call in &self.completed_calls {
+                deltas.push(tool_arguments_delta(call.index, "}".to_owned()));
+            }
+        } else {
+            deltas.push(StreamDelta::Content(format!(
+                "{TOOL_START}{buffered}{TOOL_END}"
+            )));
+        }
+        self.tool_pending.clear();
+        self.active_invoke = None;
+        self.active_parameter = None;
+        self.completed_calls.clear();
+        self.tool_state = ToolXmlState::BetweenInvokes;
+        deltas
     }
 
     /// Route decoded text that no longer represents a complete source token.
@@ -742,20 +1559,26 @@ impl ChatStreamParser {
             StreamMode::Content => vec![StreamDelta::Content(text)],
             StreamMode::Tool => {
                 self.tool_buffer.push_str(&text);
-                Vec::new()
+                self.tool_pending.push_str(&text);
+                self.process_tool_text()
             }
         }
     }
 
-    /// Flush an unterminated tool block as visible content. This keeps a
-    /// length-limited stream consistent with the non-streaming parser rather
-    /// than silently dropping everything after the opening marker.
+    /// Flush an unterminated tool block as visible content. Any speculative
+    /// tool deltas deliberately lack the closing argument-object brace, so an
+    /// invalid or length-limited block cannot reconstruct an executable call.
     pub fn finish(&mut self) -> Vec<StreamDelta> {
         if self.mode != StreamMode::Tool {
             return Vec::new();
         }
         self.mode = StreamMode::Content;
         let buffered = std::mem::take(&mut self.tool_buffer);
+        self.tool_pending.clear();
+        self.active_invoke = None;
+        self.active_parameter = None;
+        self.completed_calls.clear();
+        self.tool_state = ToolXmlState::BetweenInvokes;
         vec![StreamDelta::Content(format!("{TOOL_START}{buffered}"))]
     }
 }
@@ -882,6 +1705,37 @@ mod tests {
 
     fn parsed_arguments(call: &AssistantToolCall) -> Value {
         serde_json::from_str(&call.function.arguments).expect("valid JSON arguments")
+    }
+
+    #[derive(Default)]
+    struct AccumulatedToolCall {
+        id: Option<String>,
+        name: Option<String>,
+        arguments: String,
+    }
+
+    fn accumulate_tool_deltas(
+        calls: &mut Vec<AccumulatedToolCall>,
+        deltas: impl IntoIterator<Item = StreamDelta>,
+    ) {
+        for delta in deltas {
+            let StreamDelta::ToolCall(delta) = delta else {
+                continue;
+            };
+            if calls.len() <= delta.index {
+                calls.resize_with(delta.index + 1, AccumulatedToolCall::default);
+            }
+            let call = &mut calls[delta.index];
+            if let Some(id) = delta.id {
+                call.id = Some(id);
+            }
+            if let Some(name) = delta.function.name {
+                call.name = Some(name);
+            }
+            if let Some(arguments) = delta.function.arguments {
+                call.arguments.push_str(&arguments);
+            }
+        }
     }
 
     fn markers() -> MarkerIds {
@@ -1251,26 +2105,144 @@ mod tests {
                 .push(markers.tool_start, TOOL_START.into())
                 .is_empty()
         );
+        let mut calls = Vec::new();
+        let first = parser.push(99, "<inv".to_owned());
+        assert!(first.is_empty());
+        accumulate_tool_deltas(&mut calls, first);
         for chunk in [
-            "<inv",
             "oke name=\"read\"><parameter name=\"path\">",
             "README.md</parameter></invoke>",
         ] {
-            assert!(parser.push(99, chunk.to_owned()).is_empty());
+            accumulate_tool_deltas(&mut calls, parser.push(99, chunk.to_owned()));
         }
-        let deltas = parser.push(markers.tool_end, TOOL_END.into());
-        let [StreamDelta::ToolCalls(calls)] = deltas.as_slice() else {
-            panic!("expected a streamed tool call")
-        };
+        accumulate_tool_deltas(&mut calls, parser.push(markers.tool_end, TOOL_END.into()));
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].function.name, "read");
-        assert_eq!(parsed_arguments(&calls[0]), json!({"path": "README.md"}));
+        assert!(
+            calls[0]
+                .id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("call_"))
+        );
+        assert_eq!(calls[0].name.as_deref(), Some("read"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&calls[0].arguments).expect("complete arguments"),
+            json!({"path": "README.md"})
+        );
 
         assert!(matches!(
             parser.push(99, "after".into()).as_slice(),
             [StreamDelta::Content(text)] if text == "after"
         ));
         assert!(parser.finish().is_empty());
+    }
+
+    #[test]
+    fn stream_parser_emits_tool_arguments_before_the_closing_marker() {
+        let markers = markers();
+        let mut parser = ChatStreamParser::new(markers, registry(&[function_tool("read")]));
+
+        assert!(
+            parser
+                .push(markers.tool_start, TOOL_START.to_owned())
+                .is_empty()
+        );
+        let deltas = parser.push(
+            99,
+            concat!(
+                "<invoke name=\"read\"><parameter name=\"path\">",
+                "a/large/argument/prefix"
+            )
+            .to_owned(),
+        );
+        assert!(
+            deltas.iter().any(|delta| matches!(
+                delta,
+                StreamDelta::ToolCall(AssistantToolCallDelta {
+                    function: AssistantFunctionCallDelta {
+                        arguments: Some(arguments),
+                        ..
+                    },
+                    ..
+                }) if arguments.contains("a/large/argument/prefix")
+            )),
+            "tool-call output stayed buffered until the closing marker"
+        );
+    }
+
+    #[test]
+    fn bytewise_streaming_reconstructs_the_non_streaming_typed_call() {
+        let markers = markers();
+        let registry = registry(&[typed_tool()]);
+        let mut parser = ChatStreamParser::new(markers, registry.clone());
+        let mut streamed = Vec::new();
+        let mut ordinary_content = String::new();
+
+        parser.push(markers.tool_start, TOOL_START.to_owned());
+        for byte in typed_invoke().bytes() {
+            let deltas = parser.push(99, char::from(byte).to_string());
+            for delta in &deltas {
+                if let StreamDelta::Content(content) = delta {
+                    ordinary_content.push_str(content);
+                }
+            }
+            accumulate_tool_deltas(&mut streamed, deltas);
+        }
+        let deltas = parser.push(markers.tool_end, TOOL_END.to_owned());
+        for delta in &deltas {
+            if let StreamDelta::Content(content) = delta {
+                ordinary_content.push_str(content);
+            }
+        }
+        accumulate_tool_deltas(&mut streamed, deltas);
+
+        let complete = parse_assistant(
+            &format!("</think>{TOOL_START}{}{TOOL_END}", typed_invoke()),
+            &registry,
+        );
+        assert!(
+            ordinary_content.is_empty(),
+            "valid native XML leaked as content"
+        );
+        assert_eq!(streamed.len(), complete.tool_calls.len());
+        assert_eq!(streamed[0].name.as_deref(), Some("typed"));
+        assert_eq!(
+            streamed[0].name.as_deref(),
+            Some(complete.tool_calls[0].function.name.as_str())
+        );
+        assert_eq!(
+            streamed[0].arguments, complete.tool_calls[0].function.arguments,
+            "streaming and non-streaming argument fragments diverged"
+        );
+    }
+
+    #[test]
+    fn tool_call_deltas_have_openai_streaming_shape() {
+        let StreamDelta::ToolCall(header) = tool_call_header(3, "read".to_owned()) else {
+            unreachable!()
+        };
+        let header = serde_json::to_value(header).expect("serialize header");
+        assert_eq!(header["index"], 3);
+        assert_eq!(header["type"], "function");
+        assert!(
+            header["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("call_"))
+        );
+        assert_eq!(header["function"]["name"], "read");
+        assert_eq!(header["function"]["arguments"], "{");
+
+        let StreamDelta::ToolCall(arguments) =
+            tool_arguments_delta(3, "\"path\":\"README.md\"".to_owned())
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            serde_json::to_value(arguments).expect("serialize arguments"),
+            json!({
+                "index": 3,
+                "function": {"arguments": "\"path\":\"README.md\""}
+            })
+        );
     }
 
     #[test]
@@ -1284,32 +2256,363 @@ mod tests {
     }
 
     #[test]
+    fn stream_parser_indexes_parallel_calls_and_reconstructs_each_one() {
+        let markers = markers();
+        let registry = registry(&[empty_function_tool("first"), function_tool("read")]);
+        let body = concat!(
+            "<invoke name=\"first\"></invoke>\n",
+            "<invoke name=\"read\">",
+            "<parameter name=\"path\">README.md</parameter>",
+            "</invoke>"
+        );
+        let mut parser = ChatStreamParser::new(markers, registry.clone());
+        let mut streamed = Vec::new();
+
+        parser.push(markers.tool_start, TOOL_START.to_owned());
+        accumulate_tool_deltas(&mut streamed, parser.push(99, body.to_owned()));
+        accumulate_tool_deltas(
+            &mut streamed,
+            parser.push(markers.tool_end, TOOL_END.to_owned()),
+        );
+
+        let complete = parse_tool_calls(body, &registry);
+        assert_eq!(streamed.len(), 2);
+        assert_eq!(streamed.len(), complete.len());
+        for (streamed, complete) in streamed.iter().zip(complete) {
+            assert_eq!(
+                streamed.name.as_deref(),
+                Some(complete.function.name.as_str())
+            );
+            assert_eq!(
+                streamed.arguments, complete.function.arguments,
+                "streaming and non-streaming argument fragments diverged"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_parser_never_forwards_a_json_value_that_can_close_the_arguments_object() {
+        let markers = markers();
+        let tool = json!({
+            "type": "function",
+            "function": {
+                "name": "integer",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"n": {"type": "integer"}},
+                    "required": ["n"],
+                    "additionalProperties": false
+                }
+            }
+        });
+        let registry = registry(&[tool]);
+        let mut parser = ChatStreamParser::new(markers, registry.clone());
+        let mut streamed = Vec::new();
+
+        parser.push(markers.tool_start, TOOL_START.to_owned());
+        accumulate_tool_deltas(
+            &mut streamed,
+            parser.push(
+                99,
+                "<invoke name=\"integer\"><parameter name=\"n\">1}".to_owned(),
+            ),
+        );
+        assert_eq!(streamed.len(), 1);
+        assert!(
+            serde_json::from_str::<Value>(&streamed[0].arguments).is_err(),
+            "malformed native JSON closed the streamed argument object"
+        );
+
+        accumulate_tool_deltas(
+            &mut streamed,
+            parser.push(99, "</parameter></invoke>".to_owned()),
+        );
+        let closing = parser.push(markers.tool_end, TOOL_END.to_owned());
+        assert!(
+            closing
+                .iter()
+                .any(|delta| matches!(delta, StreamDelta::Content(_)))
+        );
+        accumulate_tool_deltas(&mut streamed, closing);
+        assert!(serde_json::from_str::<Value>(&streamed[0].arguments).is_err());
+        assert!(
+            parse_tool_calls(
+                "<invoke name=\"integer\"><parameter name=\"n\">1}</parameter></invoke>",
+                &registry
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn stream_parser_rejects_bytes_after_a_json_container_root_closes() {
+        let markers = markers();
+        let tool = json!({
+            "type": "function",
+            "function": {
+                "name": "object",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"payload": {"type": "object"}},
+                    "required": ["payload"],
+                    "additionalProperties": false
+                }
+            }
+        });
+        let registry = registry(&[tool]);
+        let mut parser = ChatStreamParser::new(markers, registry);
+        let mut streamed = Vec::new();
+
+        parser.push(markers.tool_start, TOOL_START.to_owned());
+        accumulate_tool_deltas(
+            &mut streamed,
+            parser.push(
+                99,
+                concat!(
+                    "<invoke name=\"object\"><parameter name=\"payload\">",
+                    "{\"x\":1}"
+                )
+                .to_owned(),
+            ),
+        );
+        assert!(serde_json::from_str::<Value>(&streamed[0].arguments).is_err());
+        assert!(parser.push(99, "}".to_owned()).is_empty());
+        parser.push(99, "</parameter></invoke>".to_owned());
+        let closing = parser.push(markers.tool_end, TOOL_END.to_owned());
+        assert!(
+            closing
+                .iter()
+                .any(|delta| matches!(delta, StreamDelta::Content(_)))
+        );
+        accumulate_tool_deltas(&mut streamed, closing);
+        assert!(serde_json::from_str::<Value>(&streamed[0].arguments).is_err());
+    }
+
+    #[test]
+    fn stream_parser_keeps_valid_parallel_calls_after_an_invalid_sibling() {
+        let markers = markers();
+        let invalid_tool = json!({
+            "type": "function",
+            "function": {
+                "name": "integer",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"n": {"type": "integer"}},
+                    "required": ["n"],
+                    "additionalProperties": false
+                }
+            }
+        });
+        let registry = registry(&[invalid_tool, empty_function_tool("ok")]);
+        let body = concat!(
+            "<invoke name=\"integer\">",
+            "<parameter name=\"n\">wrong</parameter>",
+            "</invoke>",
+            "<invoke name=\"ok\"></invoke>"
+        );
+        let mut parser = ChatStreamParser::new(markers, registry.clone());
+        let mut streamed = Vec::new();
+
+        parser.push(markers.tool_start, TOOL_START.to_owned());
+        accumulate_tool_deltas(&mut streamed, parser.push(99, body.to_owned()));
+        let closing = parser.push(markers.tool_end, TOOL_END.to_owned());
+        assert!(
+            !closing
+                .iter()
+                .any(|delta| matches!(delta, StreamDelta::Content(_)))
+        );
+        accumulate_tool_deltas(&mut streamed, closing);
+
+        let complete = parse_tool_calls(body, &registry);
+        assert_eq!(complete.len(), 1);
+        assert_eq!(complete[0].function.name, "ok");
+        let streamed_ok = streamed
+            .iter()
+            .find(|call| call.name.as_deref() == Some("ok"))
+            .expect("valid sibling was streamed");
+        assert_eq!(streamed_ok.arguments, "{}");
+    }
+
+    #[test]
+    fn stream_parser_respects_greater_than_inside_quoted_parameter_names() {
+        let markers = markers();
+        let tool = json!({
+            "type": "function",
+            "function": {
+                "name": "special",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"a>b": {"type": "string"}},
+                    "required": ["a>b"],
+                    "additionalProperties": false
+                }
+            }
+        });
+        let registry = registry(&[tool]);
+        let body = concat!(
+            "<invoke name=\"special\">",
+            "<parameter name=\"a>b\">value</parameter>",
+            "</invoke>"
+        );
+        let mut parser = ChatStreamParser::new(markers, registry.clone());
+        let mut streamed = Vec::new();
+
+        parser.push(markers.tool_start, TOOL_START.to_owned());
+        accumulate_tool_deltas(&mut streamed, parser.push(99, body.to_owned()));
+        let closing = parser.push(markers.tool_end, TOOL_END.to_owned());
+        assert!(
+            !closing
+                .iter()
+                .any(|delta| matches!(delta, StreamDelta::Content(_)))
+        );
+        accumulate_tool_deltas(&mut streamed, closing);
+
+        let complete = parse_tool_calls(body, &registry);
+        assert_eq!(streamed.len(), 1);
+        assert_eq!(streamed[0].arguments, complete[0].function.arguments);
+        assert_eq!(
+            serde_json::from_str::<Value>(&streamed[0].arguments).expect("valid arguments"),
+            json!({"a>b": "value"})
+        );
+    }
+
+    #[test]
+    fn stream_parser_classifies_and_streams_schema_free_values() {
+        let markers = markers();
+        let tool = json!({
+            "type": "function",
+            "function": {
+                "name": "dynamic",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": true
+                }
+            }
+        });
+        let registry = registry(&[tool]);
+        let mut parser = ChatStreamParser::new(markers, registry.clone());
+        let mut streamed = Vec::new();
+
+        parser.push(markers.tool_start, TOOL_START.to_owned());
+        let prefix = parser.push(
+            99,
+            concat!(
+                "<invoke name=\"dynamic\"><parameter name=\"payload\">",
+                "a large schema-free string prefix"
+            )
+            .to_owned(),
+        );
+        assert!(prefix.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::ToolCall(AssistantToolCallDelta {
+                function: AssistantFunctionCallDelta {
+                    arguments: Some(arguments),
+                    ..
+                },
+                ..
+            }) if arguments.contains("a large schema-free string prefix")
+        )));
+        accumulate_tool_deltas(&mut streamed, prefix);
+        accumulate_tool_deltas(
+            &mut streamed,
+            parser.push(99, "</parameter></invoke>".to_owned()),
+        );
+        accumulate_tool_deltas(
+            &mut streamed,
+            parser.push(markers.tool_end, TOOL_END.to_owned()),
+        );
+
+        let body = concat!(
+            "<invoke name=\"dynamic\"><parameter name=\"payload\">",
+            "a large schema-free string prefix",
+            "</parameter></invoke>"
+        );
+        let complete = parse_tool_calls(body, &registry);
+        assert_eq!(streamed[0].arguments, complete[0].function.arguments);
+        assert_eq!(
+            serde_json::from_str::<Value>(&streamed[0].arguments).expect("valid arguments"),
+            json!({"payload": "a large schema-free string prefix"})
+        );
+
+        let mut parser = ChatStreamParser::new(markers, registry.clone());
+        let mut structured = Vec::new();
+        parser.push(markers.tool_start, TOOL_START.to_owned());
+        let prefix = parser.push(
+            99,
+            concat!(
+                "<invoke name=\"dynamic\"><parameter name=\"payload\">",
+                "{\"items\":[1,2"
+            )
+            .to_owned(),
+        );
+        assert!(prefix.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::ToolCall(AssistantToolCallDelta {
+                function: AssistantFunctionCallDelta {
+                    arguments: Some(arguments),
+                    ..
+                },
+                ..
+            }) if arguments.contains("{\"items\":[1,2")
+        )));
+        accumulate_tool_deltas(&mut structured, prefix);
+        accumulate_tool_deltas(
+            &mut structured,
+            parser.push(99, ",3]}</parameter></invoke>".to_owned()),
+        );
+        accumulate_tool_deltas(
+            &mut structured,
+            parser.push(markers.tool_end, TOOL_END.to_owned()),
+        );
+        let structured_body = concat!(
+            "<invoke name=\"dynamic\"><parameter name=\"payload\">",
+            "{\"items\":[1,2,3]}",
+            "</parameter></invoke>"
+        );
+        let complete = parse_tool_calls(structured_body, &registry);
+        assert_eq!(structured[0].arguments, complete[0].function.arguments);
+    }
+
+    #[test]
     fn stream_parser_applies_tool_schemas() {
         let markers = markers();
         let registry = registry(&[typed_tool()]);
         let mut parser = ChatStreamParser::new(markers, registry.clone());
 
         parser.push(markers.tool_start, TOOL_START.to_owned());
-        parser.push(99, typed_invoke().to_owned());
-        let deltas = parser.push(markers.tool_end, TOOL_END.to_owned());
-        let [StreamDelta::ToolCalls(calls)] = deltas.as_slice() else {
-            panic!("expected schema-valid streamed tool call")
-        };
+        let mut calls = Vec::new();
+        accumulate_tool_deltas(&mut calls, parser.push(99, typed_invoke().to_owned()));
+        accumulate_tool_deltas(
+            &mut calls,
+            parser.push(markers.tool_end, TOOL_END.to_owned()),
+        );
         assert_eq!(calls.len(), 1);
-        assert_eq!(parsed_arguments(&calls[0]), typed_arguments());
+        assert_eq!(calls[0].name.as_deref(), Some("typed"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&calls[0].arguments).expect("complete arguments"),
+            typed_arguments()
+        );
 
         let invalid = typed_invoke().replace(
             "<parameter name=\"integer\">1</parameter>",
             "<parameter name=\"integer\">wrong</parameter>",
         );
         let mut parser = ChatStreamParser::new(markers, registry);
+        let mut invalid_call = Vec::new();
         parser.push(markers.tool_start, TOOL_START.to_owned());
-        parser.push(99, invalid.clone());
+        accumulate_tool_deltas(&mut invalid_call, parser.push(99, invalid.clone()));
+        let closing_deltas = parser.push(markers.tool_end, TOOL_END.to_owned());
         assert!(matches!(
-            parser.push(markers.tool_end, TOOL_END.to_owned()).as_slice(),
+            closing_deltas.as_slice(),
             [StreamDelta::Content(content)]
                 if content == &format!("{TOOL_START}{invalid}{TOOL_END}")
         ));
+        accumulate_tool_deltas(&mut invalid_call, closing_deltas);
+        assert_eq!(invalid_call.len(), 1);
+        assert!(
+            serde_json::from_str::<Value>(&invalid_call[0].arguments).is_err(),
+            "a schema-invalid streamed call became executable"
+        );
     }
 
     #[test]
