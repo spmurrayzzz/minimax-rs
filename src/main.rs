@@ -1,5 +1,6 @@
 mod chat;
 mod model;
+mod sampling;
 mod tokenizer;
 
 use anyhow::{Context, Result, bail};
@@ -11,7 +12,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use candle_core::{D, Device, Tensor, quantized::gguf_file};
+use candle_core::{Device, Tensor, quantized::gguf_file};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -34,14 +35,60 @@ struct Args {
     model: PathBuf,
     #[arg(long, default_value = "127.0.0.1:8080")]
     host: String,
+    /// Default sampling temperature. Zero selects greedy decoding.
+    #[arg(
+        long = "temp",
+        visible_alias = "temperature",
+        default_value_t = sampling::DEFAULT_TEMPERATURE
+    )]
+    temperature: f64,
+    /// Default nucleus-sampling probability. One disables top-p filtering.
+    #[arg(long, default_value_t = sampling::DEFAULT_TOP_P)]
+    top_p: f64,
+    /// Default number of highest-logit candidates to retain. Zero disables top-k.
+    #[arg(long, default_value_t = sampling::DEFAULT_TOP_K)]
+    top_k: usize,
     /// Parse every GGUF shard and validate the model without starting HTTP.
     #[arg(long)]
     dry_run: bool,
 }
 
+impl Args {
+    fn sampling_defaults(&self) -> Result<sampling::SamplingParams> {
+        sampling::SamplingParams {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+        }
+        .validate()
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     engine: Arc<Engine>,
+    sampling_defaults: sampling::SamplingParams,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+struct SamplingOverrides {
+    #[serde(default)]
+    temperature: Option<f64>,
+    #[serde(default)]
+    top_p: Option<f64>,
+    #[serde(default)]
+    top_k: Option<usize>,
+}
+
+impl SamplingOverrides {
+    fn resolve(self, defaults: sampling::SamplingParams) -> Result<sampling::SamplingParams> {
+        sampling::SamplingParams {
+            temperature: self.temperature.unwrap_or(defaults.temperature),
+            top_p: self.top_p.unwrap_or(defaults.top_p),
+            top_k: self.top_k.unwrap_or(defaults.top_k),
+        }
+        .validate()
+    }
 }
 
 const DEFAULT_PREFILL_CHUNK: usize = 512;
@@ -474,7 +521,7 @@ impl Engine {
         request_id: &str,
         prompt: &[u32],
         max_tokens: usize,
-        _temperature: f32,
+        sampling_params: sampling::SamplingParams,
         stop_sequences: &[String],
         mut on_deltas: F,
     ) -> Result<GenerationResult>
@@ -491,6 +538,7 @@ impl Engine {
             )
         }
         let max_tokens = max_tokens.min(MAX_CONTEXT - prompt.len());
+        let mut sampler = sampling::TokenSampler::new(sampling_params, rand::random())?;
         let mut state_guard = self
             .state
             .lock()
@@ -521,12 +569,15 @@ impl Engine {
             previous_cache_tokens,
             matching_prefix_tokens = reuse.matching_tokens,
             cached_prompt_tokens,
+            temperature = sampling_params.temperature,
+            top_p = sampling_params.top_p,
+            top_k = sampling_params.top_k,
             "starting generation"
         );
 
         // CUDA launches are asynchronous, so synchronize the final prompt
-        // logits before recording prefill time. The first argmax would impose
-        // the same dependency; doing it here gives prefill and decode cleanly
+        // logits before recording prefill time. The first token selection would
+        // impose the same dependency; doing it here gives prefill and decode cleanly
         // separated timings.
         let prefill_tokens = prompt.len() - state.cached_ids.len();
         let prefill_started = Instant::now();
@@ -558,9 +609,9 @@ impl Engine {
         let mut finish = GenerationFinish::Length;
         let mut logits_pending = false;
         for _ in 0..max_tokens {
-            // Reduce the 200k vocabulary on-device; copying every logit over
-            // PCIe and scanning it on the CPU costs roughly 0.35 ms/token.
-            let id = next.argmax(D::Minus1)?.to_scalar::<u32>()?;
+            // Greedy sampling reduces the 200k vocabulary on-device. Positive
+            // temperatures use the request-local stochastic sampler.
+            let id = sampler.sample(&next)?;
             logits_pending = false;
             if self.tokenizer.is_eog(id) {
                 // The EOG token was selected but not evaluated, so neither the
@@ -683,15 +734,12 @@ struct CompletionRequest {
     prompt: Prompt,
     #[serde(default)]
     max_tokens: Option<usize>,
-    #[serde(default = "default_temperature")]
-    temperature: f32,
+    #[serde(flatten)]
+    sampling: SamplingOverrides,
     #[serde(default)]
     stream: bool,
     #[serde(default)]
     stop: Option<StopSequences>,
-}
-fn default_temperature() -> f32 {
-    1.0
 }
 
 #[derive(Deserialize)]
@@ -710,8 +758,8 @@ struct ChatRequest {
     max_tokens: Option<usize>,
     #[serde(default)]
     max_completion_tokens: Option<usize>,
-    #[serde(default = "default_temperature")]
-    temperature: f32,
+    #[serde(flatten)]
+    sampling: SamplingOverrides,
     #[serde(default)]
     stream: bool,
     #[serde(default)]
@@ -855,6 +903,10 @@ async fn completions(
     State(state): State<AppState>,
     Json(req): Json<CompletionRequest>,
 ) -> axum::response::Response {
+    let sampling = match req.sampling.resolve(state.sampling_defaults) {
+        Ok(sampling) => sampling,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
     let stop_sequences = match normalize_stop_sequences(req.stop) {
         Ok(stops) => stops,
         Err(error) => return api_error(StatusCode::BAD_REQUEST, &error.to_string()),
@@ -887,7 +939,6 @@ async fn completions(
     }
     let prompt_tokens = prompt.len();
     let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
-    let temperature = req.temperature;
     let model_name = req.model.unwrap_or_else(|| "MiniMax-M2.7".into());
     let id = format!("cmpl-{}", Uuid::new_v4());
     let created = created_at();
@@ -903,7 +954,7 @@ async fn completions(
                 &id,
                 &prompt,
                 max_tokens,
-                temperature,
+                sampling,
                 &stop_sequences,
                 move |deltas| {
                     if token_sender.is_closed() {
@@ -969,7 +1020,7 @@ async fn completions(
             &request_id,
             &prompt,
             max_tokens,
-            temperature,
+            sampling,
             &stop_sequences,
             |_deltas| true,
         )
@@ -1004,6 +1055,10 @@ async fn chat_completions(
     if req.messages.is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "messages must not be empty");
     }
+    let sampling = match req.sampling.resolve(state.sampling_defaults) {
+        Ok(sampling) => sampling,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
     let max_tokens = req.output_limit();
     let stop_sequences = match normalize_stop_sequences(req.stop) {
         Ok(stops) => stops,
@@ -1036,7 +1091,6 @@ async fn chat_completions(
         }
     };
     let prompt_tokens = ids.len();
-    let temperature = req.temperature;
     let model_name = req.model.unwrap_or_else(|| "MiniMax-M2.7".into());
     let id = format!("chatcmpl-{}", Uuid::new_v4());
     let created = created_at();
@@ -1064,13 +1118,8 @@ async fn chat_completions(
             let mut parser = chat::ChatStreamParser::new(markers, tool_registry.clone());
             let mut streamed_tool_calls = false;
             let token_sender = sender.clone();
-            let generation = engine.generate_with(
-                &id,
-                &ids,
-                max_tokens,
-                temperature,
-                &stop_sequences,
-                |deltas| {
+            let generation =
+                engine.generate_with(&id, &ids, max_tokens, sampling, &stop_sequences, |deltas| {
                     if token_sender.is_closed() {
                         return false;
                     }
@@ -1111,8 +1160,7 @@ async fn chat_completions(
                         }
                     }
                     true
-                },
-            );
+                });
             match generation {
                 Ok(generation) => {
                     for delta in parser.finish() {
@@ -1202,7 +1250,7 @@ async fn chat_completions(
             &request_id,
             &ids,
             max_tokens,
-            temperature,
+            sampling,
             &stop_sequences,
             |_deltas| true,
         )
@@ -1254,6 +1302,9 @@ fn api_error(status: StatusCode, message: &str) -> axum::response::Response {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
     let args = Args::parse();
+    let sampling_defaults = args
+        .sampling_defaults()
+        .context("invalid server sampling settings")?;
     let engine = Arc::new(Engine::open(&args.model, !args.dry_run)?);
     if args.dry_run {
         println!("validated 4 GGUF shards for MiniMax-M2.7 on 2 CUDA devices");
@@ -1264,9 +1315,19 @@ async fn main() -> Result<()> {
         .route("/v1/models", get(models))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
-        .with_state(AppState { engine });
+        .with_state(AppState {
+            engine,
+            sampling_defaults,
+        });
     let listener = TcpListener::bind(&args.host).await?;
-    info!(address = %args.host, prefill_chunk = prefill_chunk(), "MiniMax server listening");
+    info!(
+        address = %args.host,
+        prefill_chunk = prefill_chunk(),
+        temperature = sampling_defaults.temperature,
+        top_p = sampling_defaults.top_p,
+        top_k = sampling_defaults.top_k,
+        "MiniMax server listening"
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -1337,6 +1398,83 @@ mod tests {
             CacheReuse {
                 matching_tokens: 1,
                 cached_tokens: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn cli_sampling_defaults_and_overrides_follow_llama_cpp_flags() {
+        let defaults = Args::try_parse_from(["minimax-server", "--model", "/tmp/model"])
+            .expect("default arguments");
+        assert_eq!(
+            defaults.sampling_defaults().unwrap(),
+            sampling::SamplingParams::default()
+        );
+
+        let overridden = Args::try_parse_from([
+            "minimax-server",
+            "--model",
+            "/tmp/model",
+            "--temperature",
+            "0.7",
+            "--top-p",
+            "0.8",
+            "--top-k",
+            "12",
+        ])
+        .expect("sampling overrides");
+        assert_eq!(
+            overridden.sampling_defaults().unwrap(),
+            sampling::SamplingParams {
+                temperature: 0.7,
+                top_p: 0.8,
+                top_k: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn request_sampling_fields_override_server_defaults_individually() {
+        let server_defaults = sampling::SamplingParams {
+            temperature: 0.6,
+            top_p: 0.7,
+            top_k: 8,
+        };
+        let omitted = serde_json::from_value::<CompletionRequest>(json!({
+            "prompt": "hello"
+        }))
+        .expect("completion request");
+        assert_eq!(
+            omitted.sampling.resolve(server_defaults).unwrap(),
+            server_defaults
+        );
+
+        let completion = serde_json::from_value::<CompletionRequest>(json!({
+            "prompt": "hello",
+            "temperature": 1.1,
+            "top_p": 0.9,
+            "top_k": 24
+        }))
+        .expect("completion sampling overrides");
+        assert_eq!(
+            completion.sampling.resolve(server_defaults).unwrap(),
+            sampling::SamplingParams {
+                temperature: 1.1,
+                top_p: 0.9,
+                top_k: 24,
+            }
+        );
+
+        let chat = serde_json::from_value::<ChatRequest>(json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "top_p": 0.85
+        }))
+        .expect("chat sampling override");
+        assert_eq!(
+            chat.sampling.resolve(server_defaults).unwrap(),
+            sampling::SamplingParams {
+                top_p: 0.85,
+                ..server_defaults
             }
         );
     }

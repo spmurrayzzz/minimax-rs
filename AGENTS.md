@@ -75,6 +75,5 @@ Both implementations decode these to `The user says "test". This is a simple tes
 
 ## Current limitations
 
-- Sampling is currently greedy; temperature/top-p/top-k are not fully implemented.
 - Requests are serialized through one model/KV-cache mutex; concurrent scheduling is not implemented.
 - Compare logits or generated tokens against llama.cpp when changing model math or CUDA kernels.
