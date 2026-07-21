@@ -750,6 +750,26 @@ enum Prompt {
     Batch(Vec<Prompt>),
 }
 
+fn completion_prompt_tokens(
+    prompt: Prompt,
+    encode: impl FnOnce(&str) -> Result<Vec<u32>>,
+) -> Result<Vec<u32>> {
+    let tokens = match prompt {
+        Prompt::Text(text) => {
+            encode(&text).map_err(|error| anyhow::anyhow!("tokenization failed: {error}"))?
+        }
+        Prompt::Tokens(tokens) => tokens,
+        Prompt::Batch(batch) => bail!(
+            "completion prompt batches are not supported (received {} prompts)",
+            batch.len()
+        ),
+    };
+    if tokens.is_empty() {
+        bail!("prompt must not be empty")
+    }
+    Ok(tokens)
+}
+
 #[derive(Deserialize)]
 struct ChatRequest {
     model: Option<String>,
@@ -929,32 +949,11 @@ async fn completions(
         Ok(stops) => stops,
         Err(error) => return api_error(StatusCode::BAD_REQUEST, &error.to_string()),
     };
-    let prompts = match req.prompt {
-        Prompt::Text(text) => match state.engine.tokenizer.encode(&text) {
-            Ok(ids) => vec![ids],
-            Err(error) => {
-                return api_error(
-                    StatusCode::BAD_REQUEST,
-                    &format!("tokenization failed: {error}"),
-                );
-            }
-        },
-        Prompt::Tokens(tokens) => vec![tokens],
-        Prompt::Batch(batch) => batch
-            .into_iter()
-            .filter_map(|prompt| match prompt {
-                Prompt::Text(text) => state.engine.tokenizer.encode(&text).ok(),
-                Prompt::Tokens(tokens) => Some(tokens),
-                Prompt::Batch(_) => None,
-            })
-            .collect(),
-    };
-    let Some(prompt) = prompts.into_iter().next() else {
-        return api_error(StatusCode::BAD_REQUEST, "prompt must not be empty");
-    };
-    if prompt.is_empty() {
-        return api_error(StatusCode::BAD_REQUEST, "prompt must not be empty");
-    }
+    let prompt =
+        match completion_prompt_tokens(req.prompt, |text| state.engine.tokenizer.encode(text)) {
+            Ok(prompt) => prompt,
+            Err(error) => return api_error(StatusCode::BAD_REQUEST, &error.to_string()),
+        };
     let prompt_tokens = prompt.len();
     let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
     let model_name = req.model.unwrap_or_else(|| "MiniMax-M2.7".into());
@@ -1496,7 +1495,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_prompt_deserialization_supports_openai_input_shapes() {
+    fn completion_prompt_deserialization_distinguishes_single_and_batch_shapes() {
         let Prompt::Text(text) = serde_json::from_value(json!("hello")).expect("text prompt")
         else {
             panic!("expected text prompt")
@@ -1517,6 +1516,113 @@ mod tests {
         };
         assert!(matches!(&batch[0], Prompt::Text(text) if text == "hello"));
         assert!(matches!(&batch[1], Prompt::Tokens(tokens) if tokens == &[4, 5]));
+    }
+
+    #[test]
+    fn completion_single_prompts_are_prepared_without_changing_input_shape() {
+        let mut encoded = Vec::new();
+        let text = completion_prompt_tokens(
+            serde_json::from_value(json!("hello")).expect("text prompt"),
+            |text| {
+                encoded.push(text.to_owned());
+                Ok(vec![10, 11])
+            },
+        )
+        .expect("prepared text prompt");
+        assert_eq!(text, [10, 11]);
+        assert_eq!(encoded, ["hello"]);
+
+        let mut tokenization_called = false;
+        let tokens = completion_prompt_tokens(
+            serde_json::from_value(json!([1, 2, 3])).expect("token prompt"),
+            |_| {
+                tokenization_called = true;
+                Ok(Vec::new())
+            },
+        )
+        .expect("prepared token prompt");
+        assert_eq!(tokens, [1, 2, 3]);
+        assert!(!tokenization_called);
+    }
+
+    #[test]
+    fn completion_batches_are_rejected_before_tokenization() {
+        let batches = [
+            ("text", json!(["first", "second"])),
+            ("token ID", json!([[1, 2], [3, 4]])),
+            ("mixed", json!(["first", [3, 4]])),
+            ("nested", json!([["discarded"], "accepted before fix"])),
+        ];
+
+        for (kind, value) in batches {
+            let prompt = serde_json::from_value(value).expect("well-formed batch prompt");
+            let mut tokenization_calls = 0;
+            let error = completion_prompt_tokens(prompt, |_| {
+                tokenization_calls += 1;
+                Ok(vec![99])
+            })
+            .expect_err("batch prompt must be rejected");
+
+            assert_eq!(tokenization_calls, 0, "{kind} batch was tokenized");
+            assert_eq!(
+                error.to_string(),
+                "completion prompt batches are not supported (received 2 prompts)",
+                "unexpected {kind} batch error"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_batch_endpoint_returns_http_400_before_streaming() {
+        let (tokenizer, _, _) = tokenizer::token_type_fixture().expect("test tokenizer");
+        let state = AppState {
+            engine: Arc::new(Engine {
+                ready: false,
+                state: std::sync::Mutex::new(None),
+                tokenizer,
+            }),
+            sampling_defaults: sampling::SamplingParams::default(),
+        };
+
+        for stream in [false, true] {
+            let request = serde_json::from_value(json!({
+                "prompt": ["first", [1, 2]],
+                "stream": stream
+            }))
+            .expect("batch completion request");
+            let response = completions(State(state.clone()), Json(request)).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+            let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("error response body");
+            let body: serde_json::Value =
+                serde_json::from_slice(&body).expect("JSON error response");
+            assert_eq!(
+                body["error"]["message"],
+                "completion prompt batches are not supported (received 2 prompts)"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_empty_and_malformed_batches_are_rejected() {
+        let empty = serde_json::from_value(json!([])).expect("empty prompt array");
+        let error = completion_prompt_tokens(empty, |_| Ok(vec![99]))
+            .expect_err("empty prompt must be rejected");
+        assert_eq!(error.to_string(), "prompt must not be empty");
+
+        let empty_batch = completion_prompt_tokens(Prompt::Batch(Vec::new()), |_| Ok(vec![99]))
+            .expect_err("empty batch must be rejected");
+        assert_eq!(
+            empty_batch.to_string(),
+            "completion prompt batches are not supported (received 0 prompts)"
+        );
+
+        assert!(
+            serde_json::from_value::<Prompt>(json!(["valid", {"nested": "invalid"}])).is_err(),
+            "malformed batch element must reject the entire request"
+        );
     }
 
     #[test]

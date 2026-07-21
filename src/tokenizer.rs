@@ -309,6 +309,36 @@ impl MiniMaxTokenizer {
 }
 
 #[cfg(test)]
+pub(crate) fn token_type_fixture() -> Result<(MiniMaxTokenizer, u32, u32)> {
+    let mut tokens = ByteLevel::alphabet()
+        .into_iter()
+        .map(|character| character.to_string())
+        .collect::<Vec<_>>();
+    tokens.sort();
+    tokens.push("[UNK]".to_owned());
+    let mut token_types = vec![1; tokens.len()];
+    let mut add_token = |token: &str, token_type: i32| {
+        let id = tokens.len() as u32;
+        tokens.push(token.to_owned());
+        token_types.push(token_type);
+        id
+    };
+
+    let control_id = add_token("<fim_prefix>", 3);
+    let think_start = add_token("<think>", 4);
+    let think_end = add_token("</think>", 4);
+    let tool_start = add_token("<minimax:tool_call>", 4);
+    let tool_end = add_token("</minimax:tool_call>", 4);
+    let unused_id = add_token("[PAD_UNUSED]", 5);
+    let tokenizer = MiniMaxTokenizer::from_vocab(tokens, vec![], token_types, vec![])?;
+    assert_eq!(tokenizer.think_start, think_start);
+    assert_eq!(tokenizer.think_end, think_end);
+    assert_eq!(tokenizer.tool_start, tool_start);
+    assert_eq!(tokenizer.tool_end, tool_end);
+    Ok((tokenizer, control_id, unused_id))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tokenizers::{OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer};
@@ -328,35 +358,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(pieces, ["Hello's", " ", "123", "4", "!!!\n", "世界"]);
         Ok(())
-    }
-
-    fn token_type_fixture() -> Result<(MiniMaxTokenizer, u32, u32)> {
-        let mut tokens = ByteLevel::alphabet()
-            .into_iter()
-            .map(|character| character.to_string())
-            .collect::<Vec<_>>();
-        tokens.sort();
-        tokens.push("[UNK]".to_owned());
-        let mut token_types = vec![1; tokens.len()];
-        let mut add_token = |token: &str, token_type: i32| {
-            let id = tokens.len() as u32;
-            tokens.push(token.to_owned());
-            token_types.push(token_type);
-            id
-        };
-
-        let control_id = add_token("<fim_prefix>", 3);
-        let think_start = add_token("<think>", 4);
-        let think_end = add_token("</think>", 4);
-        let tool_start = add_token("<minimax:tool_call>", 4);
-        let tool_end = add_token("</minimax:tool_call>", 4);
-        let unused_id = add_token("[PAD_UNUSED]", 5);
-        let tokenizer = MiniMaxTokenizer::from_vocab(tokens, vec![], token_types, vec![])?;
-        assert_eq!(tokenizer.think_start, think_start);
-        assert_eq!(tokenizer.think_end, think_end);
-        assert_eq!(tokenizer.tool_start, tool_start);
-        assert_eq!(tokenizer.tool_end, tool_end);
-        Ok((tokenizer, control_id, unused_id))
     }
 
     #[test]
