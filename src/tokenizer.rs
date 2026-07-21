@@ -75,10 +75,80 @@ pub struct DecodeState {
 pub struct MiniMaxTokenizer {
     inner: Tokenizer,
     eog_ids: Vec<u32>,
+    suppressed_ids: Vec<u32>,
     pub think_start: u32,
     pub think_end: u32,
     pub tool_start: u32,
     pub tool_end: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GgufTokenType {
+    Undefined,
+    Normal,
+    Unknown,
+    Control,
+    UserDefined,
+    Unused,
+    Byte,
+}
+
+impl From<i32> for GgufTokenType {
+    fn from(value: i32) -> Self {
+        match value {
+            1 => Self::Normal,
+            2 => Self::Unknown,
+            3 => Self::Control,
+            4 => Self::UserDefined,
+            5 => Self::Unused,
+            6 => Self::Byte,
+            _ => Self::Undefined,
+        }
+    }
+}
+
+struct TokenAttributes {
+    added_tokens: Vec<AddedToken>,
+    suppressed_ids: Vec<u32>,
+}
+
+fn token_attributes(tokens: &[String], token_types: &[i32]) -> Result<TokenAttributes> {
+    if tokens.len() != token_types.len() {
+        anyhow::bail!(
+            "tokenizer.ggml.token_type has {} entries for {} tokens",
+            token_types.len(),
+            tokens.len()
+        );
+    }
+
+    let mut added_tokens = Vec::new();
+    let mut suppressed_ids = Vec::new();
+    for (id, (token, token_type)) in tokens.iter().zip(token_types).enumerate() {
+        match GgufTokenType::from(*token_type) {
+            // llama.cpp recognizes control and unknown spellings only while
+            // parsing special tokens, and omits both from ordinary decoding.
+            GgufTokenType::Unknown | GgufTokenType::Control => {
+                added_tokens.push(AddedToken::from(token.clone(), true).normalized(false));
+                suppressed_ids.push(id as u32);
+            }
+            // User-defined tokens are always recognized and remain visible so
+            // the thinking and tool-call parsers can consume their markers.
+            GgufTokenType::UserDefined => {
+                added_tokens.push(AddedToken::from(token.clone(), false).normalized(false));
+            }
+            // Undefined and unused pieces are neither recognized in input nor
+            // exposed by llama.cpp's ordinary token-to-piece path.
+            GgufTokenType::Undefined | GgufTokenType::Unused => {
+                suppressed_ids.push(id as u32);
+            }
+            GgufTokenType::Normal | GgufTokenType::Byte => {}
+        }
+    }
+
+    Ok(TokenAttributes {
+        added_tokens,
+        suppressed_ids,
+    })
 }
 
 fn minimax_pre_tokenizer() -> Result<Sequence> {
@@ -97,6 +167,44 @@ fn minimax_pre_tokenizer() -> Result<Sequence> {
 }
 
 impl MiniMaxTokenizer {
+    fn from_vocab(
+        tokens: Vec<String>,
+        merges: Vec<(String, String)>,
+        token_types: Vec<i32>,
+        eog_ids: Vec<u32>,
+    ) -> Result<Self> {
+        let attributes = token_attributes(&tokens, &token_types)?;
+        let vocab: AHashMap<_, _> = tokens
+            .into_iter()
+            .enumerate()
+            .map(|(i, token)| (token, i as u32))
+            .collect();
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, merges)
+            .unk_token("[UNK]".into())
+            .build()
+            .map_err(|e| anyhow::anyhow!("BPE construction failed: {e}"))?;
+        let mut inner = Tokenizer::new(bpe);
+        inner.with_pre_tokenizer(Some(minimax_pre_tokenizer()?));
+        inner.with_decoder(Some(ByteLevelDecoder::default()));
+        inner.add_tokens(&attributes.added_tokens);
+
+        let token_id = |token: &str| {
+            inner
+                .token_to_id(token)
+                .with_context(|| format!("missing tokenizer token {token}"))
+        };
+        Ok(Self {
+            eog_ids,
+            suppressed_ids: attributes.suppressed_ids,
+            think_start: token_id("<think>")?,
+            think_end: token_id("</think>")?,
+            tool_start: token_id("<minimax:tool_call>")?,
+            tool_end: token_id("</minimax:tool_call>")?,
+            inner,
+        })
+    }
+
     pub fn from_gguf(path: &Path) -> Result<Self> {
         let mut file = File::open(path)?;
         let content = Content::read(&mut file)?;
@@ -112,6 +220,14 @@ impl MiniMaxTokenizer {
         };
         let tokens = strings("tokenizer.ggml.tokens")?;
         let merges = strings("tokenizer.ggml.merges")?;
+        let token_types = content
+            .metadata
+            .get("tokenizer.ggml.token_type")
+            .context("missing GGUF metadata tokenizer.ggml.token_type")?
+            .to_vec()?
+            .iter()
+            .map(|value| value.to_i32())
+            .collect::<candle_core::Result<Vec<_>>>()?;
         let eos = content
             .metadata
             .get("tokenizer.ggml.eos_token_id")
@@ -135,61 +251,14 @@ impl MiniMaxTokenizer {
         eog_ids.sort_unstable();
         eog_ids.dedup();
 
-        let vocab: AHashMap<_, _> = tokens
+        let merges = merges
             .into_iter()
-            .enumerate()
-            .map(|(i, s)| (s, i as u32))
-            .collect();
-        let merges: Vec<(String, String)> = merges
-            .into_iter()
-            .filter_map(|m| {
-                let (a, b) = m.split_once(' ')?;
-                Some((a.to_owned(), b.to_owned()))
+            .filter_map(|merge| {
+                let (left, right) = merge.split_once(' ')?;
+                Some((left.to_owned(), right.to_owned()))
             })
             .collect();
-        let bpe = BPE::builder()
-            .vocab_and_merges(vocab, merges)
-            .unk_token("[UNK]".into())
-            .build()
-            .map_err(|e| anyhow::anyhow!("BPE construction failed: {e}"))?;
-        let mut inner = Tokenizer::new(bpe);
-        inner.with_pre_tokenizer(Some(minimax_pre_tokenizer()?));
-        inner.with_decoder(Some(ByteLevelDecoder::default()));
-        // Control delimiters are special and should disappear when decoding
-        // generated text. Thinking and tool-call tags are ordinary added
-        // tokens in the upstream tokenizer and must remain visible to parsers.
-        let specials = ["]~!b[", "]~b]", "[e~[", "]!d~[", "[PAD200063]"];
-        inner.add_special_tokens(
-            &specials
-                .iter()
-                .map(|s| AddedToken::from(*s, true))
-                .collect::<Vec<_>>(),
-        );
-        let parser_tokens = [
-            "<think>",
-            "</think>",
-            "<minimax:tool_call>",
-            "</minimax:tool_call>",
-        ];
-        inner.add_tokens(
-            &parser_tokens
-                .iter()
-                .map(|s| AddedToken::from(*s, false))
-                .collect::<Vec<_>>(),
-        );
-        let token_id = |token: &str| {
-            inner
-                .token_to_id(token)
-                .with_context(|| format!("missing tokenizer token {token}"))
-        };
-        Ok(Self {
-            eog_ids,
-            think_start: token_id("<think>")?,
-            think_end: token_id("</think>")?,
-            tool_start: token_id("<minimax:tool_call>")?,
-            tool_end: token_id("</minimax:tool_call>")?,
-            inner,
-        })
+        Self::from_vocab(tokens, merges, token_types, eog_ids)
     }
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         Ok(self
@@ -200,9 +269,18 @@ impl MiniMaxTokenizer {
             .to_vec())
     }
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
+        let visible_ids = ids
+            .iter()
+            .copied()
+            .filter(|id| !self.is_suppressed(*id))
+            .collect::<Vec<_>>();
         self.inner
-            .decode(ids, true)
+            .decode(&visible_ids, true)
             .map_err(|e| anyhow::anyhow!("decode failed: {e}"))
+    }
+
+    fn is_suppressed(&self, id: u32) -> bool {
+        self.suppressed_ids.binary_search(&id).is_ok()
     }
 
     pub fn is_eog(&self, id: u32) -> bool {
@@ -215,6 +293,9 @@ impl MiniMaxTokenizer {
     }
 
     pub fn decode_step(&self, state: &mut DecodeState, id: u32) -> Result<Option<String>> {
+        if self.is_suppressed(id) {
+            return Ok(None);
+        }
         tokenizers::tokenizer::step_decode_stream(
             &self.inner,
             id,
@@ -249,6 +330,68 @@ mod tests {
         Ok(())
     }
 
+    fn token_type_fixture() -> Result<(MiniMaxTokenizer, u32, u32)> {
+        let mut tokens = ByteLevel::alphabet()
+            .into_iter()
+            .map(|character| character.to_string())
+            .collect::<Vec<_>>();
+        tokens.sort();
+        tokens.push("[UNK]".to_owned());
+        let mut token_types = vec![1; tokens.len()];
+        let mut add_token = |token: &str, token_type: i32| {
+            let id = tokens.len() as u32;
+            tokens.push(token.to_owned());
+            token_types.push(token_type);
+            id
+        };
+
+        let control_id = add_token("<fim_prefix>", 3);
+        let think_start = add_token("<think>", 4);
+        let think_end = add_token("</think>", 4);
+        let tool_start = add_token("<minimax:tool_call>", 4);
+        let tool_end = add_token("</minimax:tool_call>", 4);
+        let unused_id = add_token("[PAD_UNUSED]", 5);
+        let tokenizer = MiniMaxTokenizer::from_vocab(tokens, vec![], token_types, vec![])?;
+        assert_eq!(tokenizer.think_start, think_start);
+        assert_eq!(tokenizer.think_end, think_end);
+        assert_eq!(tokenizer.tool_start, tool_start);
+        assert_eq!(tokenizer.tool_end, tool_end);
+        Ok((tokenizer, control_id, unused_id))
+    }
+
+    #[test]
+    fn gguf_token_types_drive_encode_and_decode() -> Result<()> {
+        let (tokenizer, control_id, unused_id) = token_type_fixture()?;
+
+        assert_eq!(tokenizer.encode("<fim_prefix>")?, [control_id]);
+        assert_eq!(tokenizer.decode(&[control_id])?, "");
+        assert_eq!(tokenizer.encode("<think>")?, [tokenizer.think_start]);
+        assert_eq!(
+            tokenizer.decode(&[
+                tokenizer.think_start,
+                tokenizer.think_end,
+                tokenizer.tool_start,
+                tokenizer.tool_end,
+            ])?,
+            "<think></think><minimax:tool_call></minimax:tool_call>"
+        );
+        assert_ne!(tokenizer.encode("[PAD_UNUSED]")?, [unused_id]);
+        assert_eq!(tokenizer.decode(&[unused_id])?, "");
+
+        let mut state = DecodeState::default();
+        assert_eq!(tokenizer.decode_step(&mut state, control_id)?, None);
+        assert_eq!(
+            tokenizer.decode_step(&mut state, tokenizer.think_start)?,
+            Some("<think>".to_owned())
+        );
+        assert_eq!(tokenizer.decode_step(&mut state, unused_id)?, None);
+        assert_eq!(
+            tokenizer.decode_step(&mut state, tokenizer.tool_start)?,
+            Some("<minimax:tool_call>".to_owned())
+        );
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires MiniMax GGUF weights; set MINIMAX_MODEL_DIR"]
     fn gguf_tokenizer_round_trip() -> Result<()> {
@@ -265,6 +408,31 @@ mod tests {
         let ids = t.encode("test").unwrap();
         println!("test ids={ids:?} decoded={:?}", t.decode(&ids).unwrap());
         assert_eq!(t.decode(&ids).unwrap(), "test");
+        let expected_suppressed = (200000..=200049).chain(200054..=200063).collect::<Vec<_>>();
+        assert_eq!(t.suppressed_ids, expected_suppressed);
+        for id in 200000..=200049 {
+            let token = t.inner.id_to_token(id).context("missing control token")?;
+            assert_eq!(t.encode(&token)?, [id], "control token {id}: {token}");
+            assert_eq!(t.decode(&[id])?, "", "control token {id}: {token}");
+        }
+        for id in 200050..=200053 {
+            let token = t
+                .inner
+                .id_to_token(id)
+                .context("missing user-defined token")?;
+            assert_eq!(t.encode(&token)?, [id], "user-defined token {id}: {token}");
+            assert_eq!(
+                t.decode(&[id])?,
+                token,
+                "user-defined token {id} must remain visible"
+            );
+        }
+        for id in 200054..=200063 {
+            let token = t.inner.id_to_token(id).context("missing unused token")?;
+            assert_ne!(t.encode(&token)?, [id], "unused token {id}: {token}");
+            assert_eq!(t.decode(&[id])?, "", "unused token {id}: {token}");
+        }
+        assert_eq!(t.encode("[PAD200063]")?, [91, 115375, 866, 51821, 93]);
         assert_eq!(t.encode("]~!b[").unwrap(), vec![200034]);
         assert_eq!(t.encode("[e~[").unwrap(), vec![200020]);
         assert_eq!(t.encode("]~b]system").unwrap(), vec![200019, 28463]);
