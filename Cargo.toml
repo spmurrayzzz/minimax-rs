@@ -3,6 +3,7 @@ name = "minimax"
 version = "0.1.0"
 edition = "2024"
 description = "Candle inference server for MiniMax-M2.7 (GGUF)"
+license = "Apache-2.0"
 
 [features]
 default = []

@@ -1,0 +1,7 @@
+minimax-rs
+Copyright 2026 Stephen Murray
+
+Except for the third-party code under vendor/, this repository is licensed
+under the Apache License, Version 2.0. See LICENSE.
+
+The vendored code is covered by its own license terms. See vendor/README.md.

@@ -114,4 +114,6 @@ Set `BASE_URL` when the server uses another address.
 
 ## License
 
-This repository does not currently include a code license. Model weights are external and remain subject to the [MiniMax-M2.7 model license](https://github.com/MiniMax-AI/MiniMax-M2.7/blob/main/LICENSE).
+Except for code under [`vendor/`](vendor/), this repository is licensed under the [Apache License 2.0](LICENSE). Copyright 2026 Stephen Murray.
+
+Vendored crates retain their upstream licenses; see the [vendored-code license inventory](vendor/README.md) and the license files in each vendored crate. Model weights are external and remain subject to the [MiniMax-M2.7 model license](https://github.com/MiniMax-AI/MiniMax-M2.7/blob/main/LICENSE).
