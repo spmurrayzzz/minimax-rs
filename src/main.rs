@@ -1,8 +1,3 @@
-mod chat;
-mod model;
-mod sampling;
-mod tokenizer;
-
 use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
@@ -14,6 +9,7 @@ use axum::{
 };
 use candle_core::{Device, Tensor, quantized::gguf_file};
 use clap::Parser;
+use minimax::{chat, model, sampling, tokenizer};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,

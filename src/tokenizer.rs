@@ -308,8 +308,8 @@ impl MiniMaxTokenizer {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn token_type_fixture() -> Result<(MiniMaxTokenizer, u32, u32)> {
+#[doc(hidden)]
+pub fn token_type_fixture() -> Result<(MiniMaxTokenizer, u32, u32)> {
     let mut tokens = ByteLevel::alphabet()
         .into_iter()
         .map(|character| character.to_string())
@@ -396,15 +396,15 @@ mod tests {
     #[test]
     #[ignore = "requires MiniMax GGUF weights; set MINIMAX_MODEL_DIR"]
     fn gguf_tokenizer_round_trip() -> Result<()> {
-        let model_dir = std::env::var_os(minimax::model_files::MODEL_DIR_ENV)
+        let model_dir = std::env::var_os(crate::model_files::MODEL_DIR_ENV)
             .map(std::path::PathBuf::from)
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "{} must point to the directory containing the GGUF shards",
-                    minimax::model_files::MODEL_DIR_ENV
+                    crate::model_files::MODEL_DIR_ENV
                 )
             })?;
-        let shards = minimax::model_files::discover_gguf_shards(&model_dir)?;
+        let shards = crate::model_files::discover_gguf_shards(&model_dir)?;
         let t = MiniMaxTokenizer::from_gguf(&shards[0])?;
         let ids = t.encode("test").unwrap();
         println!("test ids={ids:?} decoded={:?}", t.decode(&ids).unwrap());

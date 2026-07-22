@@ -6,13 +6,14 @@ use candle_core::{
     DType, Device, Module, Tensor,
     quantized::{GgmlDType, QTensor},
 };
-use candle_nn::kv_cache::KvCache;
+use candle_nn::{Embedding, kv_cache::KvCache};
 use candle_transformers::{
     fused_moe::{FusedMoeGGUF, MoeCfg},
     models::{quantized_qwen3::RotaryEmbedding, with_tracing::QMatMul},
     quantized_nn::RmsNorm,
     quantized_var_builder::{TensorParallelShard, TensorParallelSpec, VarBuilder},
 };
+use cudarc::nccl::Id;
 use std::{path::PathBuf, sync::Arc};
 
 pub const HIDDEN_SIZE: usize = 3_072;
@@ -27,6 +28,9 @@ pub const LOCAL_KV_WIDTH: usize = LOCAL_KV_HEADS * HEAD_DIM;
 pub const EXPERTS: usize = 256;
 pub const TOPK: usize = 8;
 pub const LOCAL_MOE_INTERMEDIATE: usize = 768;
+pub const VOCAB_SIZE: usize = 200_064;
+pub const NUM_LAYERS: usize = 62;
+pub const MAX_CONTEXT: usize = 196_608;
 const NORM_EPS: f64 = 1e-6;
 
 /// Exact TP placement for all tensors in one decoder layer.
@@ -814,6 +818,331 @@ impl TensorParallelRankLayer {
 
     pub fn weight_bytes(&self) -> usize {
         self.weight_bytes
+    }
+}
+
+struct RankZeroGlobals {
+    embedding: Embedding,
+    norm: RmsNorm,
+    output: QMatMul,
+    weight_bytes: usize,
+}
+
+impl RankZeroGlobals {
+    fn load(shards: &[PathBuf], device: &Device) -> Result<Self> {
+        let prefixes = ["token_embd.", "output_norm.", "output."]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let builder = VarBuilder::from_gguf_selected(shards, &prefixes, device)
+            .context("load tensor-parallel rank-0 global tensors")?;
+        let weight_bytes = ["token_embd.weight", "output_norm.weight", "output.weight"]
+            .into_iter()
+            .map(|name| {
+                builder
+                    .get_no_shape(name)
+                    .map(|tensor| tensor.storage_size_in_bytes())
+            })
+            .collect::<candle_core::Result<Vec<_>>>()?
+            .into_iter()
+            .sum();
+        let embedding = Embedding::new(
+            builder
+                .pp("token_embd")
+                .get((VOCAB_SIZE, HIDDEN_SIZE), "weight")?
+                .dequantize(device)?,
+            HIDDEN_SIZE,
+        );
+        let norm = RmsNorm::new(HIDDEN_SIZE, NORM_EPS, builder.pp("output_norm"))?;
+        let output = QMatMul::new(HIDDEN_SIZE, VOCAB_SIZE, builder.pp("output"))?;
+        Ok(Self {
+            embedding,
+            norm,
+            output,
+            weight_bytes,
+        })
+    }
+
+    fn embed(&self, ids: &[u32], device: &Device) -> Result<Tensor> {
+        let input = Tensor::from_slice(ids, (1, ids.len()), device)?;
+        Ok(self.embedding.forward(&input)?.to_dtype(DType::F32)?)
+    }
+
+    fn logits(&self, hidden: &Tensor) -> Result<Tensor> {
+        let query_len = hidden.dim(1)?;
+        let final_hidden = hidden.narrow(1, query_len - 1, 1)?;
+        Ok(self
+            .output
+            .forward(&self.norm.forward(&final_hidden)?)?
+            .to_dtype(DType::F32)?
+            .squeeze(1)?
+            .squeeze(0)?)
+    }
+}
+
+/// Output from one process-owned TP rank. Rank 0 returns logits while rank 1
+/// returns only its replicated final hidden state.
+pub struct TensorParallelRankOutput {
+    pub hidden: Tensor,
+    pub logits: Option<Tensor>,
+}
+
+/// Complete process-owned MiniMax TP rank: all 62 rank-local decoder shards,
+/// head-sharded KV caches, the process-local collective, and rank-0-only global
+/// embedding/final-output tensors. The controller that drives two instances of
+/// this type must own no CUDA state.
+pub struct TensorParallelRankModel {
+    rank: usize,
+    device: Device,
+    layers: Vec<TensorParallelRankLayer>,
+    globals: Option<RankZeroGlobals>,
+    collective: TensorParallelRankGroup,
+    layer_weight_bytes: usize,
+}
+
+impl TensorParallelRankModel {
+    pub fn load(shards: &[PathBuf], rank: usize, device: &Device, id: Id) -> Result<Self> {
+        if shards.len() != 4 {
+            bail!(
+                "MiniMax tensor parallelism requires four GGUF shards, got {}",
+                shards.len()
+            )
+        }
+        if rank >= 2 {
+            bail!("tensor-parallel rank must be 0 or 1, got {rank}")
+        }
+        if !device.is_cuda() {
+            bail!("tensor-parallel rank {rank} requires a CUDA device")
+        }
+
+        // Establish the process group before expensive model loading so rank
+        // initialization failures are observed while both children are alive.
+        let collective = TensorParallelRankGroup::new(device, rank, id)
+            .with_context(|| format!("initialize tensor-parallel rank {rank} collectives"))?;
+        let rope = rotary_embedding(device)
+            .with_context(|| format!("construct rank {rank} rotary embedding"))?;
+        let mut layers = Vec::with_capacity(NUM_LAYERS);
+        let mut layer_weight_bytes = 0usize;
+        for layer_index in 0..NUM_LAYERS {
+            let layer =
+                TensorParallelRankLayer::load(shards, layer_index, rank, device, rope.clone())
+                    .with_context(|| {
+                        format!("load complete model layer {layer_index} rank {rank}")
+                    })?;
+            layer_weight_bytes = layer_weight_bytes
+                .checked_add(layer.weight_bytes())
+                .ok_or_else(|| anyhow::anyhow!("rank {rank} layer weight byte count overflow"))?;
+            layers.push(layer);
+        }
+        let globals = if rank == 0 {
+            Some(
+                RankZeroGlobals::load(shards, device)
+                    .context("load complete model rank-0 globals")?,
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            rank,
+            device: device.clone(),
+            layers,
+            globals,
+            collective,
+            layer_weight_bytes,
+        })
+    }
+
+    pub fn forward(&mut self, ids: &[u32], pos: usize) -> Result<TensorParallelRankOutput> {
+        self.validate_ids(ids, pos)?;
+        let initial_length = self.cache_length()?;
+        if initial_length != pos {
+            bail!(
+                "rank {} model forward position {pos} does not match cache length {initial_length}",
+                self.rank
+            )
+        }
+        let expected_length = pos
+            .checked_add(ids.len())
+            .ok_or_else(|| anyhow::anyhow!("rank {} cache length overflows usize", self.rank))?;
+
+        match self.forward_inner(ids, pos) {
+            Ok(output) => match self.cache_length() {
+                Ok(final_length) if final_length == expected_length => Ok(output),
+                Ok(final_length) => {
+                    let error = anyhow::anyhow!(
+                        "rank {} model completed with cache length {final_length}, expected {expected_length}",
+                        self.rank
+                    );
+                    self.rollback_after_error(initial_length, error)
+                }
+                Err(error) => {
+                    self.reset();
+                    Err(error.context(format!(
+                        "rank {} model completed with divergent layer caches; all caches were reset",
+                        self.rank
+                    )))
+                }
+            },
+            Err(error) => self.rollback_after_error(initial_length, error),
+        }
+    }
+
+    fn forward_inner(&mut self, ids: &[u32], pos: usize) -> Result<TensorParallelRankOutput> {
+        let query_len = ids.len();
+        let input = match &self.globals {
+            Some(globals) => globals
+                .embed(ids, &self.device)
+                .with_context(|| format!("rank {} input embedding", self.rank))?,
+            None => Tensor::zeros((1, query_len, HIDDEN_SIZE), DType::F32, &self.device)
+                .with_context(|| format!("rank {} broadcast receive allocation", self.rank))?,
+        };
+        let mut hidden = self
+            .collective
+            .broadcast_from_rank0(input)
+            .with_context(|| format!("rank {} input activation broadcast", self.rank))?;
+        for (layer_index, layer) in self.layers.iter_mut().enumerate() {
+            hidden = layer
+                .forward(hidden, pos, query_len > 1, &mut self.collective)
+                .with_context(|| {
+                    format!("complete model layer {layer_index} rank {}", self.rank)
+                })?;
+        }
+        let logits = self
+            .globals
+            .as_ref()
+            .map(|globals| globals.logits(&hidden))
+            .transpose()
+            .with_context(|| format!("rank {} final norm/output projection", self.rank))?;
+        Ok(TensorParallelRankOutput { hidden, logits })
+    }
+
+    fn validate_ids(&self, ids: &[u32], pos: usize) -> Result<()> {
+        if ids.is_empty() {
+            bail!(
+                "rank {} model input must contain at least one token",
+                self.rank
+            )
+        }
+        if let Some((index, id)) = ids
+            .iter()
+            .enumerate()
+            .find(|(_, id)| **id >= VOCAB_SIZE as u32)
+        {
+            bail!(
+                "rank {} input token {id} at position {index} is outside vocabulary size {VOCAB_SIZE}",
+                self.rank
+            )
+        }
+        let end = pos
+            .checked_add(ids.len())
+            .ok_or_else(|| anyhow::anyhow!("rank {} input position overflows usize", self.rank))?;
+        if end > MAX_CONTEXT {
+            bail!(
+                "rank {} input ends at position {end}, beyond context limit {MAX_CONTEXT}",
+                self.rank
+            )
+        }
+        Ok(())
+    }
+
+    fn rollback_after_error<T>(
+        &mut self,
+        initial_length: usize,
+        error: anyhow::Error,
+    ) -> Result<T> {
+        match self.truncate_cache(initial_length) {
+            Ok(()) => Err(error),
+            Err(rollback) => {
+                self.reset();
+                Err(error.context(format!(
+                    "rank {} complete-model cache rollback also failed ({rollback}); all caches were reset",
+                    self.rank
+                )))
+            }
+        }
+    }
+
+    pub fn reset(&mut self) {
+        for layer in &mut self.layers {
+            layer.reset();
+        }
+    }
+
+    pub fn truncate_cache(&mut self, seq_len: usize) -> Result<()> {
+        let current = self.cache_length()?;
+        if seq_len > current {
+            bail!(
+                "rank {} cannot truncate complete-model cache from {current} to {seq_len}",
+                self.rank
+            )
+        }
+        for layer_index in 0..self.layers.len() {
+            if let Err(error) = self.layers[layer_index].truncate_cache(seq_len) {
+                self.reset();
+                return Err(error).with_context(|| {
+                    format!(
+                        "truncate complete-model layer {layer_index} rank {}; all rank-local caches were reset",
+                        self.rank
+                    )
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn cache_length(&self) -> Result<usize> {
+        let first = self
+            .layers
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("rank {} model has no layers", self.rank))?;
+        let length = first.cache_length();
+        for (layer_index, layer) in self.layers.iter().enumerate().skip(1) {
+            if layer.cache_length() != length {
+                bail!(
+                    "rank {} layer {layer_index} cache length {} differs from layer 0 length {length}",
+                    self.rank,
+                    layer.cache_length()
+                )
+            }
+        }
+        Ok(length)
+    }
+
+    pub fn cache_shape(&self) -> Result<Option<Vec<usize>>> {
+        self.layers
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("rank {} model has no layers", self.rank))?
+            .cache_shape()
+    }
+
+    pub fn rank(&self) -> usize {
+        self.rank
+    }
+
+    pub fn nccl_version(&self) -> i32 {
+        self.collective.nccl_version()
+    }
+
+    pub fn collective_backend(&self) -> &'static str {
+        self.collective.backend()
+    }
+
+    pub fn layer_weight_bytes(&self) -> usize {
+        self.layer_weight_bytes
+    }
+
+    pub fn global_weight_bytes(&self) -> usize {
+        self.globals
+            .as_ref()
+            .map_or(0, |globals| globals.weight_bytes)
+    }
+
+    pub fn close_peer_mapping(&mut self) -> Result<()> {
+        self.collective.close_peer_mapping()
+    }
+
+    pub fn free_local_peer_buffer(&mut self) -> Result<()> {
+        self.collective.free_local_peer_buffer()
     }
 }
 
