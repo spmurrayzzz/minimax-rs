@@ -337,7 +337,7 @@ pub fn render_prompt(
     }
     let (system, conversation) = if messages
         .first()
-        .is_some_and(|message| message.role == "system")
+        .is_some_and(|message| matches!(message.role.as_str(), "system" | "developer"))
     {
         (messages.first(), &messages[1..])
     } else {
@@ -474,6 +474,9 @@ pub fn render_prompt(
                     prompt.push_str("[e~[\n");
                 }
             }
+            // llama.cpp maps every developer role to system before applying the
+            // MiniMax template, which consumes only the leading system message.
+            "system" | "developer" => {}
             // Ignore unsupported roles rather than accidentally rendering them as users.
             _ => {}
         }
@@ -2153,6 +2156,25 @@ mod tests {
             "]~!b[]~b]system\nFollow policy.\nCurrent date: 2026-04-01\nCurrent location: London[e~[\n"
         ));
         assert!(prompt.contains("]~b]user\nHi[e~[\n"));
+    }
+
+    #[test]
+    fn renders_leading_developer_like_llama_cpp_and_ignores_later_policy_roles() {
+        let request: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/minimax-developer-prompt-request.json"
+        ))
+        .expect("valid OpenAI request fixture");
+        let messages = serde_json::from_value::<Vec<ChatMessage>>(request["messages"].clone())
+            .expect("valid messages");
+
+        let prompt = render_prompt(&messages, &[], false).expect("render prompt");
+
+        assert_eq!(
+            prompt,
+            include_str!("../tests/fixtures/minimax-developer-prompt.txt")
+        );
+        assert!(!prompt.contains("Late system policy."));
+        assert!(!prompt.contains("Late developer policy."));
     }
 
     #[test]

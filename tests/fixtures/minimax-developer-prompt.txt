@@ -1,0 +1,10 @@
+]~!b[]~b]system
+Primary developer policy.[e~[
+]~b]user
+First question.[e~[
+]~b]ai
+First answer.[e~[
+]~b]user
+Second question.[e~[
+]~b]ai
+<think>

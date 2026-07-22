@@ -1,0 +1,12 @@
+{
+  "messages": [
+    {"role": "developer", "content": "Primary developer policy."},
+    {"role": "user", "content": "First question."},
+    {"role": "system", "content": "Late system policy."},
+    {"role": "developer", "content": "Late developer policy."},
+    {"role": "assistant", "content": "First answer."},
+    {"role": "user", "content": "Second question."}
+  ],
+  "tools": [],
+  "add_generation_prompt": true
+}
