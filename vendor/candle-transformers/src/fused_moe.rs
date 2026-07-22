@@ -1,7 +1,7 @@
 // Adapted from: https://github.com/guoqingbao/vllm.rs/blob/main/src/models/layers/moe.rs
 use candle::Module;
-use candle::{quantized::QTensor, DType, Result, Tensor, D};
-use candle_nn::{linear_no_bias, moe, Activation, Linear, VarBuilder};
+use candle::{D, DType, Result, Tensor, quantized::QTensor};
+use candle_nn::{Activation, Linear, VarBuilder, linear_no_bias, moe};
 use std::sync::Arc;
 
 pub struct MoeCfg {
@@ -94,7 +94,8 @@ impl FusedMoe {
         let (num_tokens, hidden_dim) = xs.dims2()?;
 
         let router_logits = self.gate.forward(&xs)?;
-        let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits.to_dtype(DType::F32)?)?;
+        let routing_weights =
+            candle_nn::ops::softmax_last_dim(&router_logits.to_dtype(DType::F32)?)?;
 
         let topk_ids = routing_weights
             .arg_sort_last_dim(false)?
@@ -186,7 +187,11 @@ impl FusedMoeGGUF {
             .to_dtype(DType::F32)?;
 
         let gate = Linear::new(gate_ws, None);
-        let router_bias = vb.pp("exp_probs_b").get(num_experts, "bias")?.dequantize(vb.device())?.to_dtype(DType::F32)?;
+        let router_bias = vb
+            .pp("exp_probs_b")
+            .get(num_experts, "bias")?
+            .dequantize(vb.device())?
+            .to_dtype(DType::F32)?;
 
         let (gate_experts, up_experts, down_experts) = {
             (
@@ -220,6 +225,29 @@ impl FusedMoeGGUF {
         })
     }
 
+    fn routing_flattened(&self, xs: &Tensor) -> Result<(Tensor, Tensor)> {
+        let router_logits = self.gate.forward(xs)?;
+        let routing_weights = candle_nn::ops::sigmoid(&router_logits.to_dtype(DType::F32)?)?;
+        let selection_weights = routing_weights.broadcast_add(&self.router_bias)?;
+        let (_, topk_ids) = selection_weights.sort_last_dim(false)?;
+        let topk_ids = topk_ids
+            .narrow(D::Minus1, 0, self.num_experts_per_tok)?
+            .contiguous()?;
+        let mut topk_weights = routing_weights.gather(&topk_ids, D::Minus1)?;
+        if self.norm_topk_prob {
+            topk_weights = topk_weights.broadcast_div(&topk_weights.sum_keepdim(D::Minus1)?)?;
+        }
+        Ok((topk_ids, topk_weights))
+    }
+
+    /// Returns selected expert IDs and normalized sigmoid routing weights for
+    /// diagnostics and tensor-parallel rank-consistency checks.
+    pub fn routing(&self, xs: &Tensor) -> Result<(Tensor, Tensor)> {
+        let (_, _, hidden_dim) = xs.dims3()?;
+        let xs = xs.reshape(((), hidden_dim))?.to_dtype(DType::F32)?;
+        self.routing_flattened(&xs)
+    }
+
     pub fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
         let (batch, seq_len, hidden_dim) = xs.dims3()?;
         let xs = xs.reshape(((), hidden_dim))?;
@@ -230,29 +258,24 @@ impl FusedMoeGGUF {
         } else {
             xs.to_owned()
         };
-
-        let router_logits = self.gate.forward(&xs)?;
-        let routing_weights = candle_nn::ops::sigmoid(&router_logits.to_dtype(DType::F32)?)?;
-        let selection_weights = routing_weights.broadcast_add(&self.router_bias)?;
-
-        let (_, topk_ids) = selection_weights.sort_last_dim(false)?;
-        let topk_ids = topk_ids
-            .narrow(D::Minus1, 0, self.num_experts_per_tok)?
-            .contiguous()?;
-
-        let mut topk_weights = routing_weights.gather(&topk_ids, D::Minus1)?;
-
-        if self.norm_topk_prob {
-            topk_weights = topk_weights.broadcast_div(&topk_weights.sum_keepdim(D::Minus1)?)?;
-        }
-
-        let (expert_ids, sorted_token_ids) = if num_tokens == 1 {
-            // The single-token decode route list fits in one tiny bitonic-sort
-            // block and avoids CUB's setup/allocation overhead.
-            topk_ids.flatten_all()?.sort_last_dim(true)?
+        let num_experts = self.gate_experts.shape().dims3()?.0;
+        let (topk_weights, expert_ids, sorted_token_ids) = if num_tokens == 1
+            && num_experts == 256
+            && self.num_experts_per_tok == 8
+            && self.norm_topk_prob
+        {
+            let router_logits = self.gate.forward(&xs)?;
+            let (_, topk_weights, expert_ids, sorted_token_ids) =
+                moe::minimax_moe_decode_topk(&router_logits, &self.router_bias)?;
+            (topk_weights, expert_ids, sorted_token_ids)
         } else {
-            let num_experts = self.gate_experts.shape().dims3()?.0;
-            moe::sort_routes(&topk_ids, num_experts)?
+            let (topk_ids, topk_weights) = self.routing_flattened(&xs)?;
+            let (expert_ids, sorted_token_ids) = if num_tokens == 1 {
+                topk_ids.flatten_all()?.sort_last_dim(true)?
+            } else {
+                moe::sort_routes(&topk_ids, num_experts)?
+            };
+            (topk_weights, expert_ids, sorted_token_ids)
         };
         let mut ys = if num_tokens == 1
             && self.num_experts_per_tok == 8

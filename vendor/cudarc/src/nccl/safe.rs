@@ -483,6 +483,125 @@ impl<'a> Drop for Group<'a> {
     }
 }
 
+/// An NCCL group spanning multiple communicators.
+///
+/// Unlike [`Group`], this keeps synchronization guards for operations issued
+/// through different rank communicators alive until the shared
+/// `ncclGroupEnd`. This is required when one host thread enqueues every local
+/// rank: recording a cudarc allocation event before `ncclGroupEnd` would mark
+/// the write complete before NCCL has actually placed it on the CUDA stream.
+#[derive(Debug)]
+pub struct MultiCommGroup<'a> {
+    comms: &'a [Comm],
+    syncs: Vec<SyncOnDrop<'a>>,
+    active: bool,
+}
+
+impl Drop for MultiCommGroup<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            // Drop cannot report an NCCL error. Callers should use `finish`;
+            // this fallback only closes a group while unwinding an earlier
+            // operation error.
+            let _ = group_end();
+        }
+    }
+}
+
+impl<'a> MultiCommGroup<'a> {
+    /// Starts one NCCL group for operations across all supplied communicators.
+    pub fn new(comms: &'a [Comm]) -> Result<Self, result::NcclError> {
+        group_start()?;
+        Ok(Self {
+            comms,
+            syncs: Vec::new(),
+            active: true,
+        })
+    }
+
+    fn comm(&self, rank: usize) -> Result<&'a Comm, result::NcclError> {
+        // A rank/index mismatch is a programming error and cannot be expressed
+        // by NCCL's error enum, so retain the same contract as the existing
+        // single-communicator group API.
+        let comm = self
+            .comms
+            .get(rank)
+            .unwrap_or_else(|| panic!("NCCL communicator index {rank} is out of range"));
+        assert_eq!(comm.rank, rank, "NCCL communicator rank/index mismatch");
+        Ok(comm)
+    }
+
+    /// Enqueues an out-of-place all-reduce for one rank in this group.
+    pub fn all_reduce<'s: 'a, 'r: 'a, T: NcclType>(
+        &mut self,
+        rank: usize,
+        sendbuff: CudaView<'s, T>,
+        recvbuff: CudaViewMut<'r, T>,
+        reduce_op: &ReduceOp,
+    ) -> Result<result::NcclStatus, result::NcclError> {
+        let comm = self.comm(rank)?;
+        assert_eq!(sendbuff.len(), recvbuff.len(), "NCCL all-reduce buffer length mismatch");
+        let count = sendbuff.len();
+        let (src, record_src) = sendbuff.view_ptr(&comm.stream);
+        let (dst, record_dst) = recvbuff.view_ptr_mut(&comm.stream);
+        let status = unsafe {
+            result::all_reduce(
+                src as _,
+                dst as _,
+                count,
+                T::as_nccl_type(),
+                convert_to_nccl_reduce_op(reduce_op),
+                comm.comm,
+                comm.stream.cu_stream as _,
+            )
+        }?;
+        self.syncs.push(record_src);
+        self.syncs.push(record_dst);
+        Ok(status)
+    }
+
+    /// Enqueues an out-of-place broadcast for one rank in this group.
+    pub fn broadcast<'s: 'a, 'r: 'a, T: NcclType>(
+        &mut self,
+        rank: usize,
+        sendbuff: Option<CudaView<'s, T>>,
+        recvbuff: CudaViewMut<'r, T>,
+        root: i32,
+    ) -> Result<result::NcclStatus, result::NcclError> {
+        let comm = self.comm(rank)?;
+        assert!(sendbuff.is_some() || comm.rank != root as usize, "NCCL broadcast root requires a send buffer");
+        let count = recvbuff.len();
+        if let Some(sendbuff) = &sendbuff {
+            assert_eq!(sendbuff.len(), count, "NCCL broadcast buffer length mismatch");
+        }
+        let (src, record_src) = sendbuff.map(|buffer| buffer.view_ptr(&comm.stream)).unzip();
+        let (dst, record_dst) = recvbuff.view_ptr_mut(&comm.stream);
+        let status = unsafe {
+            result::broadcast(
+                src.map(|ptr| ptr as _).unwrap_or(std::ptr::null()),
+                dst as _,
+                count,
+                T::as_nccl_type(),
+                root,
+                comm.comm,
+                comm.stream.cu_stream as _,
+            )
+        }?;
+        if let Some(record_src) = record_src {
+            self.syncs.push(record_src);
+        }
+        self.syncs.push(record_dst);
+        Ok(status)
+    }
+
+    /// Ends the NCCL group before releasing any stream/allocation guards.
+    pub fn finish(mut self) -> Result<result::NcclStatus, result::NcclError> {
+        let status = group_end();
+        self.active = false;
+        status
+    }
+}
+
 impl Comm {
     /// Initializes a new group call: https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/groups.html
     pub fn group(&self) -> Group<'_> {

@@ -12,12 +12,13 @@ fn grouped_causal_reference(
     v: &Tensor,
     past_len: usize,
 ) -> candle_core::Result<Tensor> {
-    let (_, _, query_len, _) = q.dims4()?;
+    let (_, query_heads, query_len, _) = q.dims4()?;
+    let kv_heads = k.dim(1)?;
     let kv_len = k.dim(2)?;
-    let grouped_q = q.reshape((1, KV_HEADS, (QUERY_HEADS / KV_HEADS) * query_len, HEAD_DIM))?;
+    let grouped_q = q.reshape((1, kv_heads, (query_heads / kv_heads) * query_len, HEAD_DIM))?;
     let scores = (grouped_q.matmul(&k.transpose(2, 3)?.contiguous()?)?
         * (1.0 / (HEAD_DIM as f64).sqrt()))?
-    .reshape((1, KV_HEADS, QUERY_HEADS / KV_HEADS, query_len, kv_len))?;
+    .reshape((1, kv_heads, query_heads / kv_heads, query_len, kv_len))?;
     let mask = (0..query_len)
         .flat_map(|query| {
             (0..kv_len).map(move |key| {
@@ -32,9 +33,9 @@ fn grouped_causal_reference(
     let mask = Tensor::from_vec(mask, (1, 1, 1, query_len, kv_len), q.device())?
         .to_dtype(scores.dtype())?;
     candle_nn::ops::softmax_last_dim(&scores.broadcast_add(&mask)?)?
-        .reshape((1, KV_HEADS, (QUERY_HEADS / KV_HEADS) * query_len, kv_len))?
+        .reshape((1, kv_heads, (query_heads / kv_heads) * query_len, kv_len))?
         .matmul(v)?
-        .reshape((1, QUERY_HEADS, query_len, HEAD_DIM))
+        .reshape((1, query_heads, query_len, HEAD_DIM))
 }
 
 fn flash_prefill(q: &Tensor, k: &Tensor, v: &Tensor) -> candle_core::Result<Tensor> {
@@ -134,6 +135,45 @@ fn flash_prefill_matches_grouped_causal_attention() -> Result<()> {
         "context={context} max_abs={max_abs}"
     );
 
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an sm_120 CUDA device"]
+fn tp2_decode_specialization_matches_grouped_attention() -> Result<()> {
+    const TP_QUERY_HEADS: usize = 24;
+    const TP_KV_HEADS: usize = 4;
+
+    let device = Device::new_cuda(0)?;
+    unsafe { device.as_cuda_device()?.disable_event_tracking() };
+    for context in [1usize, 513, 8_192, 8_193] {
+        let capacity = context.div_ceil(4_096) * 4_096;
+        let q = Tensor::randn(0f32, 1f32, (1, TP_QUERY_HEADS, 1, HEAD_DIM), &device)?
+            .to_dtype(DType::F16)?;
+        let k = Tensor::randn(0f32, 1f32, (1, TP_KV_HEADS, capacity, HEAD_DIM), &device)?
+            .to_dtype(DType::F16)?
+            .narrow(2, 0, context)?;
+        let v = Tensor::randn(0f32, 1f32, (1, TP_KV_HEADS, capacity, HEAD_DIM), &device)?
+            .to_dtype(DType::F16)?
+            .narrow(2, 0, context)?;
+        let reference = grouped_causal_reference(&q, &k, &v, context - 1)?;
+        let candidate = candle_nn::fused_attention::gqa_decode_tp2_f16_128(
+            &q,
+            &k,
+            &v,
+            1.0 / (HEAD_DIM as f32).sqrt(),
+        )?;
+        let max_abs = (&reference - &candidate)?
+            .abs()?
+            .to_dtype(DType::F32)?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        eprintln!("TP2 decode context={context} max_abs={max_abs}");
+        assert!(
+            max_abs <= 0.003_906_25,
+            "context={context} max_abs={max_abs}"
+        );
+    }
     Ok(())
 }
 

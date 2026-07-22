@@ -8,11 +8,25 @@ use std::mem::MaybeUninit;
 #[derive(Clone, PartialEq, Eq)]
 pub struct NcclError(pub sys::ncclResult_t);
 
-impl std::fmt::Debug for NcclError {
+impl std::fmt::Display for NcclError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "NcclError")
+        let message = unsafe { sys::ncclGetErrorString(self.0) };
+        if message.is_null() {
+            write!(f, "NCCL error {:?}", self.0)
+        } else {
+            let message = unsafe { std::ffi::CStr::from_ptr(message) }.to_string_lossy();
+            write!(f, "NCCL error {:?}: {message}", self.0)
+        }
     }
 }
+
+impl std::fmt::Debug for NcclError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::error::Error for NcclError {}
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum NcclStatus {

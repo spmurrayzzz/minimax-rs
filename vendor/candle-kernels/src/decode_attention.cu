@@ -49,6 +49,7 @@ __global__ __launch_bounds__(THREADS, 2) void gqa_split_f16_128(
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int tid = threadIdx.x;
+    const int query_heads = gridDim.y * GQA_GROUP;
 
     const int causal_len = past_len + query + 1;
     const int split_begin = static_cast<int>((static_cast<int64_t>(causal_len) * split) / num_splits);
@@ -157,7 +158,7 @@ __global__ __launch_bounds__(THREADS, 2) void gqa_split_f16_128(
             value += warp_acc[w][group][tid] * combine_weight[group][w];
         }
         float *partial = partials +
-            ((query * num_splits + split) * QUERY_HEADS + q_head_base + group) * PARTIAL_STRIDE;
+            ((query * num_splits + split) * query_heads + q_head_base + group) * PARTIAL_STRIDE;
         partial[2 + tid] = value;
         if (tid == 0) {
             partial[0] = block_max[group];
@@ -321,6 +322,7 @@ __global__ __launch_bounds__(THREADS, 2) void gqa_decode_split_mma_f16_128(
     const int split = blockIdx.x;
     const int kv_head = blockIdx.y;
     const int tid = threadIdx.y * 32 + threadIdx.x;
+    const int query_heads = gridDim.y * GQA_GROUP;
 
     // Partition complete 128-key tiles rather than raw token counts. Raw
     // splits create a padded MMA tail in every block (up to 95 redundant tiles
@@ -468,7 +470,7 @@ __global__ __launch_bounds__(THREADS, 2) void gqa_decode_split_mma_f16_128(
 #pragma unroll
     for (int group = 0; group < GQA_GROUP; ++group) {
         float *partial = partials +
-            (split * QUERY_HEADS + q_head_base + group) * PARTIAL_STRIDE;
+            (split * query_heads + q_head_base + group) * PARTIAL_STRIDE;
         partial[2 + tid] = accumulator[group];
         if (tid == 0) {
             partial[0] = online_max[group];
@@ -551,6 +553,7 @@ __global__ __launch_bounds__(THREADS, 2) void gqa_decode_split_mma_n8_f16_128(
     const int warp = threadIdx.y;
     const int lane = threadIdx.x;
     const int tid = warp * 32 + lane;
+    const int query_heads = gridDim.y * GQA_GROUP;
 
     const int tile_count = (seq_len + MMA_KEY_TILE - 1) / MMA_KEY_TILE;
     const int first_tile = static_cast<int>((static_cast<int64_t>(tile_count) * split) / num_splits);
@@ -769,7 +772,7 @@ __global__ __launch_bounds__(THREADS, 2) void gqa_decode_split_mma_n8_f16_128(
             value += __half2float(warp_values[(w * N8_GROUPS + group) * HEAD_DIM + tid]);
         }
         float *partial = partials +
-            (split * QUERY_HEADS + q_head_base + group) * PARTIAL_STRIDE;
+            (split * query_heads + q_head_base + group) * PARTIAL_STRIDE;
         partial[2 + tid] = value;
         if (tid == group) {
             float sum = 0.0f;
@@ -793,8 +796,9 @@ __global__ __launch_bounds__(THREADS, 2) void gqa_combine_f16_128(
     const int q_head = blockIdx.x;
     const int query = blockIdx.y;
     const int dim = threadIdx.x;
+    const int query_heads = gridDim.x;
     const float *query_partials =
-        partials + query * num_splits * QUERY_HEADS * PARTIAL_STRIDE;
+        partials + query * num_splits * query_heads * PARTIAL_STRIDE;
 
     __shared__ float weights[MAX_SPLITS];
     __shared__ float denominators[MAX_SPLITS];
@@ -804,7 +808,7 @@ __global__ __launch_bounds__(THREADS, 2) void gqa_combine_f16_128(
     if (dim == 0) {
         float max_value = -FLT_MAX;
         for (int split = 0; split < num_splits; ++split) {
-            const float *partial = query_partials + (split * QUERY_HEADS + q_head) * PARTIAL_STRIDE;
+            const float *partial = query_partials + (split * query_heads + q_head) * PARTIAL_STRIDE;
             max_value = fmaxf(max_value, partial[0]);
         }
         global_max = max_value;
@@ -812,7 +816,7 @@ __global__ __launch_bounds__(THREADS, 2) void gqa_combine_f16_128(
     __syncthreads();
 
     if (dim < num_splits) {
-        const float *partial = query_partials + (dim * QUERY_HEADS + q_head) * PARTIAL_STRIDE;
+        const float *partial = query_partials + (dim * query_heads + q_head) * PARTIAL_STRIDE;
         const float weight = partial[1] == 0.0f ? 0.0f : __expf(partial[0] - global_max);
         weights[dim] = weight;
         denominators[dim] = partial[1] * weight;
@@ -830,7 +834,7 @@ __global__ __launch_bounds__(THREADS, 2) void gqa_combine_f16_128(
 
     float value = 0.0f;
     for (int split = 0; split < num_splits; ++split) {
-        const float *partial = query_partials + (split * QUERY_HEADS + q_head) * PARTIAL_STRIDE;
+        const float *partial = query_partials + (split * query_heads + q_head) * PARTIAL_STRIDE;
         value += partial[2 + dim] * weights[split];
     }
     output[(q_head * query_len + query) * HEAD_DIM + dim] = __float2half_rn(value / global_sum);
@@ -849,11 +853,13 @@ extern "C" void launch_gqa_decode_mma_f16_128(
     int k_head_stride,
     int v_head_stride,
     int num_splits,
+    int query_heads,
+    int kv_heads,
     float scale,
     int device,
     void *stream) {
     cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    const dim3 split_grid(num_splits, KV_HEADS);
+    const dim3 split_grid(num_splits, kv_heads);
     const dim3 mma_block(32, WARPS);
     constexpr size_t n8_shared_bytes =
         2 * MMA_KEY_TILE * N8_V_STRIDE * sizeof(half2);
@@ -904,7 +910,7 @@ extern "C" void launch_gqa_decode_mma_f16_128(
             num_splits,
             scale);
     }
-    gqa_combine_f16_128<<<QUERY_HEADS, THREADS, 0, cuda_stream>>>(
+    gqa_combine_f16_128<<<query_heads, THREADS, 0, cuda_stream>>>(
         static_cast<const float *>(partials),
         static_cast<half *>(output),
         1,
@@ -924,10 +930,12 @@ extern "C" void launch_gqa_f16_128(
     int k_head_stride,
     int v_head_stride,
     int num_splits,
+    int query_heads,
+    int kv_heads,
     float scale,
     void *stream) {
     cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    const dim3 split_grid(num_splits, KV_HEADS, query_len);
+    const dim3 split_grid(num_splits, kv_heads, query_len);
     gqa_split_f16_128<<<split_grid, THREADS, 0, cuda_stream>>>(
         static_cast<const half *>(q),
         static_cast<const half *>(k),
@@ -940,7 +948,7 @@ extern "C" void launch_gqa_f16_128(
         v_head_stride,
         num_splits,
         scale);
-    const dim3 combine_grid(QUERY_HEADS, query_len);
+    const dim3 combine_grid(query_heads, query_len);
     gqa_combine_f16_128<<<combine_grid, THREADS, 0, cuda_stream>>>(
         static_cast<const float *>(partials),
         static_cast<half *>(output),

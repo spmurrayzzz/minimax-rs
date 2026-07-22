@@ -18,7 +18,9 @@ candle-flash-attn = "0.11"
 candle-nn = { version = "0.11", features = ["cuda"] }
 candle-transformers = { version = "0.11", features = ["cuda"] }
 clap = { version = "4", features = ["derive", "env"] }
+cudarc = { version = "0.19.8", features = ["f16", "nccl-02030"] }
 jsonschema = { version = "0.48", default-features = false }
+libc = "0.2"
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

@@ -871,6 +871,170 @@ extern "C" __global__ void qkv_rmsnorm_f16_cuda1(
   }
 }
 
+__device__ __forceinline__ void tp2_store_release(unsigned int *address,
+                                                    unsigned int value) {
+  asm volatile("st.release.sys.global.u32 [%1], %0;" : : "r"(value), "l"(address));
+}
+
+__device__ __forceinline__ unsigned int
+tp2_load_acquire(const unsigned int *address) {
+  unsigned int value;
+  asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(value) : "l"(address));
+  return value;
+}
+
+// One-block, two-rank all-reduce for latency-sensitive F32 tensors. Inputs and
+// synchronization words live in persistent peer-visible cudaMalloc buffers.
+extern "C" __global__ void tp2_peer_all_reduce_f32_cuda1(
+    const float *__restrict__ local, const float *__restrict__ peer,
+    const float *__restrict__ residual, const float *__restrict__ norm_weight,
+    float *__restrict__ output, float *__restrict__ normalized_output,
+    unsigned int *__restrict__ self_signal,
+    unsigned int *__restrict__ peer_signal, const unsigned int epoch,
+    const int count, const float norm_eps) {
+  const int tid = (int)threadIdx.x;
+  __shared__ unsigned int operation_epoch;
+  if (tid == 0) {
+    operation_epoch =
+        epoch == 0 ? atomicAdd(self_signal + 2, 1U) + 1U : epoch;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    tp2_store_release(peer_signal, operation_epoch);
+    while (tp2_load_acquire(self_signal) != operation_epoch) {
+    }
+  }
+  __syncthreads();
+  float square_sum = 0.0f;
+  for (int index = tid; index < count; index += (int)blockDim.x) {
+    const float reduced = local[index] + peer[index];
+    const float value = residual == nullptr ? reduced : reduced + residual[index];
+    output[index] = value;
+    square_sum += value * value;
+  }
+  if (normalized_output != nullptr) {
+    __shared__ float sums[256];
+    sums[tid] = square_sum;
+    for (int stride = 128; stride > 0; stride >>= 1) {
+      __syncthreads();
+      if (tid < stride) sums[tid] += sums[tid + stride];
+    }
+    __syncthreads();
+    const float scale = rsqrtf(sums[0] / (float)count + norm_eps);
+    for (int index = tid; index < count; index += (int)blockDim.x) {
+      normalized_output[index] = output[index] * scale * norm_weight[index];
+    }
+  }
+  __syncthreads();
+  if (tid == 0) {
+    tp2_store_release(peer_signal + 1, operation_epoch);
+    while (tp2_load_acquire(self_signal + 1) != operation_epoch) {
+    }
+  }
+}
+
+extern "C" __global__ void tp2_peer_broadcast_f32_cuda1(
+    const float *__restrict__ source, float *__restrict__ output,
+    unsigned int *__restrict__ self_signal,
+    unsigned int *__restrict__ peer_signal, const unsigned int epoch,
+    const int rank, const int count) {
+  const int tid = (int)threadIdx.x;
+  __shared__ unsigned int operation_epoch;
+  if (tid == 0) {
+    operation_epoch =
+        epoch == 0 ? atomicAdd(self_signal + 2, 1U) + 1U : epoch;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    tp2_store_release(peer_signal, operation_epoch);
+    while (tp2_load_acquire(self_signal) != operation_epoch) {
+    }
+  }
+  __syncthreads();
+  if (rank == 1) {
+    for (int index = tid; index < count; index += (int)blockDim.x) {
+      output[index] = source[index];
+    }
+  }
+  __syncthreads();
+  if (tid == 0) {
+    tp2_store_release(peer_signal + 1, operation_epoch);
+    while (tp2_load_acquire(self_signal + 1) != operation_epoch) {
+    }
+  }
+}
+
+// TP decode cannot normalize Q/K until rank-local sums have been reduced.
+// Compute both local statistics in one launch without materializing square
+// tensors or invoking the generic reduction path.
+extern "C" __global__ void qkv_tp_sumsq_f32_cuda1(
+    const float *__restrict__ q, const float *__restrict__ k,
+    float *__restrict__ stats, const int q_rows, const int k_rows) {
+  const int projection = (int)blockIdx.x;
+  const int tid = (int)threadIdx.x;
+  const int ncols = projection == 0 ? q_rows : k_rows;
+  const float *src = projection == 0 ? q : k;
+  float sum = 0.0f;
+  for (int col = tid; col < ncols; col += (int)blockDim.x) {
+    const float value = src[col];
+    sum += value * value;
+  }
+  sum = warp_reduce_sum_f32(sum);
+  __shared__ float warp_sums[32];
+  const int warp = tid / WARP_SIZE;
+  const int lane = tid % WARP_SIZE;
+  if (lane == 0) warp_sums[warp] = sum;
+  __syncthreads();
+  sum = warp_sums[lane];
+  sum = warp_reduce_sum_f32(sum);
+  if (tid == 0) stats[projection] = sum;
+}
+
+// Apply globally-normalized Q/K weights, F16 conversion, partial RoPE, and V
+// conversion in one launch after the two-element TP statistics all-reduce.
+extern "C" __global__ void qkv_tp_rmsnorm_rope_f16_cuda1(
+    const float *__restrict__ q, const float *__restrict__ k,
+    const float *__restrict__ v, const float *__restrict__ global_stats,
+    const float *__restrict__ q_alpha, const float *__restrict__ k_alpha,
+    const float *__restrict__ cos, const float *__restrict__ sin,
+    half *__restrict__ dst, const int q_rows, const int k_rows,
+    const int v_rows, const int q_full_rows, const int k_full_rows,
+    const int head_dim, const int rope_dim, const int position,
+    const float eps) {
+  const int index = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  const int total = q_rows + k_rows + v_rows;
+  if (index >= total) return;
+  if (index >= q_rows + k_rows) {
+    dst[index] = (half)v[index - q_rows - k_rows];
+    return;
+  }
+
+  const bool is_q = index < q_rows;
+  const int local = is_q ? index : index - q_rows;
+  const float *src = is_q ? q : k;
+  const float *alpha = is_q ? q_alpha : k_alpha;
+  const int full_rows = is_q ? q_full_rows : k_full_rows;
+  const float scale = rsqrtf(global_stats[is_q ? 0 : 1] /
+                                 (float)full_rows +
+                             eps);
+  const int head_col = local % head_dim;
+  const half value = (half)(scale * src[local] * alpha[local]);
+  if (head_col >= rope_dim) {
+    dst[index] = value;
+    return;
+  }
+
+  const int half_rope = rope_dim / 2;
+  const int pair = head_col < half_rope ? local + half_rope : local - half_rope;
+  const int freq = head_col < half_rope ? head_col : head_col - half_rope;
+  const half paired = (half)(scale * src[pair] * alpha[pair]);
+  const half c = __float2half_rn(cos[position * half_rope + freq]);
+  const half s = __float2half_rn(sin[position * half_rope + freq]);
+  dst[index] = head_col < half_rope
+                   ? __hsub(__hmul(value, c), __hmul(paired, s))
+                   : __hadd(__hmul(paired, s), __hmul(value, c));
+}
+
 extern "C" __global__ void partial_rope_f16_cuda1(
     const half *__restrict__ q, const half *__restrict__ k,
     const float *__restrict__ cos, const float *__restrict__ sin,
@@ -1169,6 +1333,53 @@ extern "C" void launch_mmvq_gguf_qkv_q8_0_f32_rmsnorm_f16(
   qkv_rmsnorm_f16_cuda1<<<dim3(3, 1, 1), dim3(1024, 1, 1), 0, s>>>(
       (const float *)projection_dst, (const float *)q_alpha,
       (const float *)k_alpha, (half *)dst, q_rows, k_rows, v_rows, eps);
+}
+
+extern "C" void launch_tp2_peer_all_reduce_f32(
+    const void *local, const void *peer, const void *residual,
+    const void *norm_weight, void *output, void *normalized_output,
+    void *self_signal, void *peer_signal, unsigned int epoch, int count,
+    float norm_eps, void *stream) {
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  tp2_peer_all_reduce_f32_cuda1<<<dim3(1, 1, 1), dim3(256, 1, 1), 0, s>>>(
+      (const float *)local, (const float *)peer, (const float *)residual,
+      (const float *)norm_weight, (float *)output, (float *)normalized_output,
+      (unsigned int *)self_signal, (unsigned int *)peer_signal, epoch, count,
+      norm_eps);
+}
+
+extern "C" void launch_tp2_peer_broadcast_f32(
+    const void *source, void *output, void *self_signal, void *peer_signal,
+    unsigned int epoch, int rank, int count, void *stream) {
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  tp2_peer_broadcast_f32_cuda1<<<dim3(1, 1, 1), dim3(256, 1, 1), 0, s>>>(
+      (const float *)source, (float *)output, (unsigned int *)self_signal,
+      (unsigned int *)peer_signal, epoch, rank, count);
+}
+
+extern "C" void launch_qkv_tp_sumsq_f32(
+    const void *q, const void *k, void *stats, int q_rows, int k_rows,
+    void *stream) {
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  qkv_tp_sumsq_f32_cuda1<<<dim3(2, 1, 1), dim3(1024, 1, 1), 0, s>>>(
+      (const float *)q, (const float *)k, (float *)stats, q_rows, k_rows);
+}
+
+extern "C" void launch_qkv_tp_rmsnorm_rope_f16(
+    const void *q, const void *k, const void *v, const void *global_stats,
+    const void *q_alpha, const void *k_alpha, const void *cos,
+    const void *sin, void *dst, int q_rows, int k_rows, int v_rows,
+    int q_full_rows, int k_full_rows, int head_dim, int rope_dim,
+    int position, float eps, void *stream) {
+  const int total = q_rows + k_rows + v_rows;
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  qkv_tp_rmsnorm_rope_f16_cuda1<<<dim3((total + 255) / 256, 1, 1),
+                                      dim3(256, 1, 1), 0, s>>>(
+      (const float *)q, (const float *)k, (const float *)v,
+      (const float *)global_stats, (const float *)q_alpha,
+      (const float *)k_alpha, (const float *)cos, (const float *)sin,
+      (half *)dst, q_rows, k_rows, v_rows, q_full_rows, k_full_rows,
+      head_dim, rope_dim, position, eps);
 }
 
 extern "C" void launch_partial_rope_f16(

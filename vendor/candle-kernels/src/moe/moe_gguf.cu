@@ -11,6 +11,7 @@
 #include "gguf.cuh"
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cub/block/block_radix_sort.cuh>
 #include <cstdio>
 #include <cstdint>
 #include <type_traits>
@@ -25,6 +26,77 @@ constexpr int pad(int size, int padding) {
 // Optional helper if you want ceil division explicitly
 constexpr int ceil_div(int a, int b) {
     return (a + b - 1) / b;
+}
+
+// MiniMax's one-token router always selects eight of 256 experts. Fuse
+// sigmoid, expert-bias selection, top-k extraction, normalization, and the
+// expert-ID ordering consumed by the decode MoE kernel.
+extern "C" __global__ void minimax_moe_decode_topk_kernel(
+    const float *__restrict__ logits, const float *__restrict__ bias,
+    uint32_t *__restrict__ topk_ids, float *__restrict__ topk_weights,
+    uint32_t *__restrict__ expert_ids, uint32_t *__restrict__ route_ids) {
+    constexpr int experts = 256;
+    constexpr int topk = 8;
+    using BlockSort = cub::BlockRadixSort<float, experts, 1, uint32_t>;
+    __shared__ typename BlockSort::TempStorage sort_storage;
+    __shared__ float routing_weights[experts];
+    __shared__ float selected_weights[topk];
+    __shared__ uint32_t selected_ids[topk];
+    __shared__ uint32_t selected_routes[topk];
+
+    const int tid = (int)threadIdx.x;
+    const float routing = 1.0f / (1.0f + expf(-logits[tid]));
+    routing_weights[tid] = routing;
+    float selection[1] = {routing + bias[tid]};
+    uint32_t id[1] = {(uint32_t)tid};
+    BlockSort(sort_storage).SortDescending(selection, id);
+    __syncthreads();
+    if (tid < topk) {
+        topk_ids[tid] = id[0];
+        selected_ids[tid] = id[0];
+        selected_routes[tid] = (uint32_t)tid;
+        selected_weights[tid] = routing_weights[id[0]];
+    }
+    __syncthreads();
+
+    if (tid < 4) selected_weights[tid] += selected_weights[tid + 4];
+    __syncthreads();
+    if (tid < 2) selected_weights[tid] += selected_weights[tid + 2];
+    __syncthreads();
+    if (tid == 0) selected_weights[0] += selected_weights[1];
+    __syncthreads();
+    if (tid < topk) {
+        topk_weights[tid] = routing_weights[topk_ids[tid]] / selected_weights[0];
+    }
+
+    if (tid == 0) {
+        // Match argsort(topk_ids, ascending): expert IDs become sorted values
+        // and route IDs preserve their original top-k positions.
+        for (int i = 1; i < topk; ++i) {
+            const uint32_t key = selected_ids[i];
+            const uint32_t route = selected_routes[i];
+            int j = i - 1;
+            while (j >= 0 && selected_ids[j] > key) {
+                selected_ids[j + 1] = selected_ids[j];
+                selected_routes[j + 1] = selected_routes[j];
+                --j;
+            }
+            selected_ids[j + 1] = key;
+            selected_routes[j + 1] = route;
+        }
+        for (int i = 0; i < topk; ++i) {
+            expert_ids[i] = selected_ids[i];
+            route_ids[i] = selected_routes[i];
+        }
+    }
+}
+
+extern "C" void minimax_moe_decode_topk(
+    const float *logits, const float *bias, uint32_t *topk_ids,
+    float *topk_weights, uint32_t *expert_ids, uint32_t *route_ids,
+    cudaStream_t stream) {
+    minimax_moe_decode_topk_kernel<<<1, 256, 0, stream>>>(
+        logits, bias, topk_ids, topk_weights, expert_ids, route_ids);
 }
 
 namespace vllm_rs {

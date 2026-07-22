@@ -38,6 +38,16 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn minimax_moe_decode_topk(
+        logits: *const f32,
+        bias: *const f32,
+        topk_ids: *mut u32,
+        topk_weights: *mut f32,
+        expert_ids: *mut u32,
+        route_ids: *mut u32,
+        stream: i64,
+    );
+
     pub fn moe_gemm_gguf_decode_silu(
         input: *const f32,
         gate_weights: *const c_void,
@@ -492,6 +502,59 @@ extern "C" {
         eps: f32,
         stream: *mut c_void,
     );
+    pub fn launch_tp2_peer_all_reduce_f32(
+        local: *const c_void,
+        peer: *const c_void,
+        residual: *const c_void,
+        norm_weight: *const c_void,
+        output: *mut c_void,
+        normalized_output: *mut c_void,
+        self_signal: *mut c_void,
+        peer_signal: *mut c_void,
+        epoch: u32,
+        count: i32,
+        norm_eps: f32,
+        stream: *mut c_void,
+    );
+    pub fn launch_tp2_peer_broadcast_f32(
+        source: *const c_void,
+        output: *mut c_void,
+        self_signal: *mut c_void,
+        peer_signal: *mut c_void,
+        epoch: u32,
+        rank: i32,
+        count: i32,
+        stream: *mut c_void,
+    );
+    pub fn launch_qkv_tp_sumsq_f32(
+        q: *const c_void,
+        k: *const c_void,
+        stats: *mut c_void,
+        q_rows: i32,
+        k_rows: i32,
+        stream: *mut c_void,
+    );
+    pub fn launch_qkv_tp_rmsnorm_rope_f16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        global_stats: *const c_void,
+        q_alpha: *const c_void,
+        k_alpha: *const c_void,
+        cos: *const c_void,
+        sin: *const c_void,
+        dst: *mut c_void,
+        q_rows: i32,
+        k_rows: i32,
+        v_rows: i32,
+        q_full_rows: i32,
+        k_full_rows: i32,
+        head_dim: i32,
+        rope_dim: i32,
+        position: i32,
+        eps: f32,
+        stream: *mut c_void,
+    );
     pub fn launch_partial_rope_f16(
         q: *const c_void,
         k: *const c_void,
@@ -516,6 +579,8 @@ extern "C" {
         k_head_stride: i32,
         v_head_stride: i32,
         num_splits: i32,
+        query_heads: i32,
+        kv_heads: i32,
         scale: f32,
         device_ordinal: i32,
         stream: *mut c_void,
@@ -533,6 +598,8 @@ extern "C" {
         k_head_stride: i32,
         v_head_stride: i32,
         num_splits: i32,
+        query_heads: i32,
+        kv_heads: i32,
         scale: f32,
         stream: *mut c_void,
     );

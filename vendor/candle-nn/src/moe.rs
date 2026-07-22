@@ -3,7 +3,7 @@
 use candle::cuda_backend::kernels::ffi;
 #[allow(unused_imports)]
 use candle::quantized::{self, QTensor};
-use candle::{Result, Tensor};
+use candle::{DType, Result, Tensor};
 
 fn wmma_min_tokens() -> usize {
     static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -448,6 +448,109 @@ pub fn moe_gemm_gguf(
             candle::bail!("moe_gemm_gguf only accepts f32 inputs")
         }
     }
+}
+
+/// Fused MiniMax one-token sigmoid router and biased top-8 selection.
+#[cfg(feature = "cuda")]
+pub fn minimax_moe_decode_topk(
+    logits: &Tensor,
+    bias: &Tensor,
+) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
+    use candle::cuda_backend::kernels::ffi;
+    use candle::op::BackpropOp;
+
+    const EXPERTS: usize = 256;
+    const TOPK: usize = 8;
+    if logits.dtype() != DType::F32
+        || bias.dtype() != DType::F32
+        || logits.elem_count() != EXPERTS
+        || bias.elem_count() != EXPERTS
+        || !logits.device().same_device(bias.device())
+    {
+        candle::bail!("invalid tensors for fused MiniMax decode routing")
+    }
+    let logits = logits.contiguous()?;
+    let bias = bias.contiguous()?;
+    let dev = logits.device().as_cuda_device()?;
+    let stream = dev.cuda_stream();
+    let (logits_storage, logits_layout) = logits.storage_and_layout();
+    let logits_slice = match &*logits_storage {
+        candle::Storage::Cuda(storage) => storage.as_cuda_slice::<f32>()?,
+        _ => candle::bail!("MiniMax router logits must be a CUDA tensor"),
+    };
+    let (logits_start, logits_end) = logits_layout
+        .contiguous_offsets()
+        .ok_or_else(|| candle::Error::Msg("MiniMax router logits must be contiguous".into()))?;
+    let logits_slice = logits_slice.slice(logits_start..logits_end);
+    let (bias_storage, bias_layout) = bias.storage_and_layout();
+    let bias_slice = match &*bias_storage {
+        candle::Storage::Cuda(storage) => storage.as_cuda_slice::<f32>()?,
+        _ => candle::bail!("MiniMax router bias must be a CUDA tensor"),
+    };
+    let (bias_start, bias_end) = bias_layout
+        .contiguous_offsets()
+        .ok_or_else(|| candle::Error::Msg("MiniMax router bias must be contiguous".into()))?;
+    let bias_slice = bias_slice.slice(bias_start..bias_end);
+
+    let topk_ids = unsafe { dev.alloc::<u32>(TOPK) }?;
+    let topk_weights = unsafe { dev.alloc::<f32>(TOPK) }?;
+    let expert_ids = unsafe { dev.alloc::<u32>(TOPK) }?;
+    let route_ids = unsafe { dev.alloc::<u32>(TOPK) }?;
+    unsafe {
+        ffi::minimax_moe_decode_topk(
+            logits_slice.device_ptr(&stream).0 as *const f32,
+            bias_slice.device_ptr(&stream).0 as *const f32,
+            topk_ids.device_ptr(topk_ids.stream()).0 as *mut u32,
+            topk_weights.device_ptr(topk_weights.stream()).0 as *mut f32,
+            expert_ids.device_ptr(expert_ids.stream()).0 as *mut u32,
+            route_ids.device_ptr(route_ids.stream()).0 as *mut u32,
+            stream.cu_stream() as i64,
+        );
+    }
+    Ok((
+        Tensor::from_storage(
+            candle::Storage::Cuda(candle::CudaStorage::wrap_cuda_slice(
+                topk_ids,
+                dev.clone(),
+            )),
+            (1, TOPK),
+            BackpropOp::none(),
+            false,
+        ),
+        Tensor::from_storage(
+            candle::Storage::Cuda(candle::CudaStorage::wrap_cuda_slice(
+                topk_weights,
+                dev.clone(),
+            )),
+            (1, TOPK),
+            BackpropOp::none(),
+            false,
+        ),
+        Tensor::from_storage(
+            candle::Storage::Cuda(candle::CudaStorage::wrap_cuda_slice(
+                expert_ids,
+                dev.clone(),
+            )),
+            TOPK,
+            BackpropOp::none(),
+            false,
+        ),
+        Tensor::from_storage(
+            candle::Storage::Cuda(candle::CudaStorage::wrap_cuda_slice(route_ids, dev.clone())),
+            TOPK,
+            BackpropOp::none(),
+            false,
+        ),
+    ))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn minimax_moe_decode_topk(
+    _: &Tensor,
+    _: &Tensor,
+) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+    candle::bail!("fused MiniMax decode routing is only implemented for CUDA")
 }
 
 /// Fused one-token, top-8 GGUF MoE decode with a SiLU gate.

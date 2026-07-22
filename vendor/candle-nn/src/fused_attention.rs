@@ -4,6 +4,8 @@ use candle::{DType, Result, Tensor};
 
 const QUERY_HEADS: usize = 48;
 const KV_HEADS: usize = 8;
+const TP2_QUERY_HEADS: usize = 24;
+const TP2_KV_HEADS: usize = 4;
 const HEAD_DIM: usize = 128;
 const MAX_QUERY_LEN: usize = 512;
 const MAX_SPLITS: usize = 128;
@@ -40,6 +42,43 @@ pub fn gqa_decode_f16_128(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Res
     gqa_decode_f16_128_with_splits(q, k, v, scale, num_splits)
 }
 
+/// Fused single-token F16 GQA for one MiniMax TP=2 rank (24 query
+/// heads, 4 KV heads, and 128-element heads).
+///
+/// This is a distinct validated entry point from [`gqa_decode_f16_128`]; the
+/// CUDA implementation shares only the fixed six-query-heads-per-KV-head
+/// kernel body.
+pub fn gqa_decode_tp2_f16_128(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
+    let seq_len = k.dim(2)?;
+    let num_splits = if seq_len >= 8_192 {
+        if (20_480..49_152).contains(&seq_len) {
+            64
+        } else {
+            16
+        }
+    } else {
+        match seq_len {
+            0..2_048 => 32,
+            _ => 64,
+        }
+    };
+    gqa_f16_128_with_splits(
+        q,
+        k,
+        v,
+        seq_len.saturating_sub(1),
+        scale,
+        num_splits,
+        TP2_QUERY_HEADS,
+        TP2_KV_HEADS,
+    )
+}
+
 /// Fused causal multi-token F16 GQA for MiniMax prefill.
 ///
 /// Sequence splits are reduced with online softmax, so workspace is bounded by
@@ -55,7 +94,16 @@ pub fn gqa_prefill_f16_128(
     let query_len = q.dim(2)?;
     let kv_len = k.dim(2)?;
     let num_splits = prefill_num_splits(query_len, kv_len)?;
-    gqa_f16_128_with_splits(q, k, v, past_len, scale, num_splits)
+    gqa_f16_128_with_splits(
+        q,
+        k,
+        v,
+        past_len,
+        scale,
+        num_splits,
+        QUERY_HEADS,
+        KV_HEADS,
+    )
 }
 
 /// Total temporary/output allocation made by [`gqa_prefill_f16_128`] for the
@@ -63,7 +111,7 @@ pub fn gqa_prefill_f16_128(
 #[doc(hidden)]
 pub fn gqa_prefill_workspace_bytes(query_len: usize, kv_len: usize) -> Result<usize> {
     let num_splits = prefill_num_splits(query_len, kv_len)?;
-    allocation_sizes(query_len, num_splits).map(|(_, _, bytes)| bytes)
+    allocation_sizes(query_len, num_splits, QUERY_HEADS).map(|(_, _, bytes)| bytes)
 }
 
 fn prefill_num_splits(query_len: usize, kv_len: usize) -> Result<usize> {
@@ -86,14 +134,18 @@ fn prefill_num_splits(query_len: usize, kv_len: usize) -> Result<usize> {
     Ok(occupancy_splits.max(context_splits).clamp(1, MAX_SPLITS))
 }
 
-fn allocation_sizes(query_len: usize, num_splits: usize) -> Result<(usize, usize, usize)> {
+fn allocation_sizes(
+    query_len: usize,
+    num_splits: usize,
+    query_heads: usize,
+) -> Result<(usize, usize, usize)> {
     let partial_count = query_len
         .checked_mul(num_splits)
-        .and_then(|n| n.checked_mul(QUERY_HEADS))
+        .and_then(|n| n.checked_mul(query_heads))
         .and_then(|n| n.checked_mul(PARTIAL_STRIDE))
         .ok_or_else(|| candle::Error::Msg("fused GQA partial workspace overflows usize".into()))?;
     let output_count = query_len
-        .checked_mul(QUERY_HEADS)
+        .checked_mul(query_heads)
         .and_then(|n| n.checked_mul(HEAD_DIM))
         .ok_or_else(|| candle::Error::Msg("fused GQA output size overflows usize".into()))?;
     let bytes = partial_count
@@ -117,7 +169,16 @@ pub fn gqa_decode_f16_128_with_splits(
     num_splits: usize,
 ) -> Result<Tensor> {
     let seq_len = k.dim(2)?;
-    gqa_f16_128_with_splits(q, k, v, seq_len.saturating_sub(1), scale, num_splits)
+    gqa_f16_128_with_splits(
+        q,
+        k,
+        v,
+        seq_len.saturating_sub(1),
+        scale,
+        num_splits,
+        QUERY_HEADS,
+        KV_HEADS,
+    )
 }
 
 /// Variant exposed for kernel validation and tuning.
@@ -130,7 +191,16 @@ pub fn gqa_prefill_f16_128_with_splits(
     scale: f32,
     num_splits: usize,
 ) -> Result<Tensor> {
-    gqa_f16_128_with_splits(q, k, v, past_len, scale, num_splits)
+    gqa_f16_128_with_splits(
+        q,
+        k,
+        v,
+        past_len,
+        scale,
+        num_splits,
+        QUERY_HEADS,
+        KV_HEADS,
+    )
 }
 
 #[cfg(feature = "cuda")]
@@ -141,6 +211,8 @@ fn gqa_f16_128_with_splits(
     past_len: usize,
     scale: f32,
     num_splits: usize,
+    expected_query_heads: usize,
+    expected_kv_heads: usize,
 ) -> Result<Tensor> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle::cuda_backend::kernels::ffi;
@@ -150,9 +222,9 @@ fn gqa_f16_128_with_splits(
         candle::bail!("fused GQA attention requires F16 Q/K/V")
     }
     let (q_batch, query_heads, query_len, q_head_dim) = q.dims4()?;
-    if (q_batch, query_heads, q_head_dim) != (1, QUERY_HEADS, HEAD_DIM) {
+    if (q_batch, query_heads, q_head_dim) != (1, expected_query_heads, HEAD_DIM) {
         candle::bail!(
-            "fused GQA attention expected Q shape (1, {QUERY_HEADS}, query_len, {HEAD_DIM}), got {:?}",
+            "fused GQA attention expected Q shape (1, {expected_query_heads}, query_len, {HEAD_DIM}), got {:?}",
             q.shape()
         )
     }
@@ -162,9 +234,11 @@ fn gqa_f16_128_with_splits(
         )
     }
     let (batch, kv_heads, seq_len, head_dim) = k.dims4()?;
-    if (batch, kv_heads, head_dim) != (1, KV_HEADS, HEAD_DIM) || v.dims4()? != k.dims4()? {
+    if (batch, kv_heads, head_dim) != (1, expected_kv_heads, HEAD_DIM)
+        || v.dims4()? != k.dims4()?
+    {
         candle::bail!(
-            "fused GQA attention expected matching K/V shape (1, {KV_HEADS}, seq, {HEAD_DIM}), got {:?} and {:?}",
+            "fused GQA attention expected matching K/V shape (1, {expected_kv_heads}, seq, {HEAD_DIM}), got {:?} and {:?}",
             k.shape(),
             v.shape()
         )
@@ -229,7 +303,8 @@ fn gqa_f16_128_with_splits(
     let v_head_stride = to_i32("V head", v_stride[1])?;
 
     let dev = q.device().as_cuda_device()?;
-    let (partial_count, output_count, _) = allocation_sizes(query_len, num_splits)?;
+    let (partial_count, output_count, _) =
+        allocation_sizes(query_len, num_splits, expected_query_heads)?;
     let partials = unsafe { dev.alloc::<f32>(partial_count) }?;
     let output = unsafe { dev.alloc::<half::f16>(output_count) }?;
     let stream = dev.cuda_stream();
@@ -253,6 +328,8 @@ fn gqa_f16_128_with_splits(
                 k_head_stride,
                 v_head_stride,
                 num_splits as i32,
+                expected_query_heads as i32,
+                expected_kv_heads as i32,
                 scale,
                 stream.context().ordinal() as i32,
                 stream_ptr,
@@ -271,6 +348,8 @@ fn gqa_f16_128_with_splits(
                 k_head_stride,
                 v_head_stride,
                 num_splits as i32,
+                expected_query_heads as i32,
+                expected_kv_heads as i32,
                 scale,
                 stream_ptr,
             );
@@ -280,7 +359,7 @@ fn gqa_f16_128_with_splits(
     let output = candle::CudaStorage::wrap_cuda_slice(output, dev.clone());
     Ok(Tensor::from_storage(
         candle::Storage::Cuda(output),
-        (1, QUERY_HEADS, query_len, HEAD_DIM),
+        (1, expected_query_heads, query_len, HEAD_DIM),
         BackpropOp::none(),
         false,
     ))
@@ -293,6 +372,8 @@ fn gqa_f16_128_with_splits(
     _: &Tensor,
     _: usize,
     _: f32,
+    _: usize,
+    _: usize,
     _: usize,
 ) -> Result<Tensor> {
     candle::bail!("fused GQA attention is only implemented for CUDA")
