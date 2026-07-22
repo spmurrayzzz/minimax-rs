@@ -33,7 +33,7 @@ struct Args {
     /// Directory containing the four split GGUF files.
     #[arg(long, env = "MINIMAX_MODEL_DIR", value_name = "DIR")]
     model: PathBuf,
-    #[arg(long, default_value = "127.0.0.1:8080")]
+    #[arg(long, default_value = "127.0.0.1:8000")]
     host: String,
     /// Default sampling temperature. Zero selects greedy decoding.
     #[arg(

@@ -28,7 +28,7 @@ Parse shard metadata, construct the tokenizer, and initialize both CUDA devices 
 CUDA_COMPUTE_CAP=120f cargo run --release -- --dry-run
 ```
 
-The server defaults to `127.0.0.1:8080`. Run the API smoke test against an already-running server with:
+The server defaults to `127.0.0.1:8000`. Run the API smoke test against an already-running server with:
 
 ```bash
 ./scripts/test-completion.sh
@@ -68,7 +68,7 @@ Full startup loads roughly 128 GB of weights and can take several minutes. Do no
 When changing inference code, test an actual request rather than only startup. At minimum verify:
 
 ```bash
-curl --fail-with-body -sS -X POST http://127.0.0.1:8080/v1/completions \
+curl --fail-with-body -sS -X POST http://127.0.0.1:8000/v1/completions \
   -H 'content-type: application/json' \
   -d '{"prompt":"Hello","max_tokens":1,"temperature":0}'
 ```

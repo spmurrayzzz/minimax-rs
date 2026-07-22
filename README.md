@@ -17,7 +17,7 @@ The server does not download or distribute model weights. It runs on one machine
 
 ## Run
 
-Set the model directory, then start the server on its default address, `127.0.0.1:8080`:
+Set the model directory, then start the server on its default address, `127.0.0.1:8000`:
 
 ```bash
 export MINIMAX_MODEL_DIR="<directory-containing-the-four-gguf-shards>"
@@ -36,7 +36,7 @@ To inspect shard metadata, construct the tokenizer, and verify that two CUDA dev
 CUDA_COMPUTE_CAP=120f cargo run --release -- --dry-run
 ```
 
-Use `--host 0.0.0.0:8080` only when remote access is intentional. The server has no built-in authentication or TLS and should otherwise remain on localhost or behind a trusted authenticated proxy.
+Use `--host 0.0.0.0:8000` only when remote access is intentional. The server has no built-in authentication or TLS and should otherwise remain on localhost or behind a trusted authenticated proxy.
 
 Sampling defaults to MiniMax's recommended `temperature=1.0`, `top_p=0.95`, and `top_k=40`. Server defaults can be changed with `--temp` (or `--temperature`), `--top-p`, and `--top-k`; request fields override them individually. Use `temperature=0` for greedy decoding, `top_p=1` to disable nucleus filtering, or `top_k=0` to disable top-k filtering.
 
@@ -52,7 +52,7 @@ Endpoints:
 Minimal chat request:
 
 ```bash
-curl --fail-with-body -sS http://127.0.0.1:8080/v1/chat/completions \
+curl --fail-with-body -sS http://127.0.0.1:8000/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{
     "messages": [{"role": "user", "content": "Hello"}],
