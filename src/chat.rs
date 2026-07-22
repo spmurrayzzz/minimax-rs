@@ -81,6 +81,109 @@ pub fn visible_text(value: Option<&Value>) -> String {
     }
 }
 
+fn push_python_string_repr(value: &str, output: &mut String) {
+    let quote = if value.contains('\'') && !value.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    output.push(quote);
+    for character in value.chars() {
+        match character {
+            '\\' => output.push_str("\\\\"),
+            character if character == quote => {
+                output.push('\\');
+                output.push(character);
+            }
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            character if character.is_control() => {
+                let codepoint = character as u32;
+                if codepoint <= 0xff {
+                    write!(output, "\\x{codepoint:02x}").expect("writing to a String cannot fail");
+                } else if codepoint <= 0xffff {
+                    write!(output, "\\u{codepoint:04x}").expect("writing to a String cannot fail");
+                } else {
+                    write!(output, "\\U{codepoint:08x}").expect("writing to a String cannot fail");
+                }
+            }
+            character => output.push(character),
+        }
+    }
+    output.push(quote);
+}
+
+fn push_jinja_value_repr(value: &Value, output: &mut String) {
+    match value {
+        Value::Null => output.push_str("None"),
+        Value::Bool(value) => output.push_str(if *value { "True" } else { "False" }),
+        Value::Number(value) => write!(output, "{value}").expect("writing to a String cannot fail"),
+        Value::String(value) => push_python_string_repr(value, output),
+        Value::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push_str(", ");
+                }
+                push_jinja_value_repr(value, output);
+            }
+            output.push(']');
+        }
+        Value::Object(values) => {
+            output.push('{');
+            for (index, (key, value)) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push_str(", ");
+                }
+                push_python_string_repr(key, output);
+                output.push_str(": ");
+                push_jinja_value_repr(value, output);
+            }
+            output.push('}');
+        }
+    }
+}
+
+fn template_value_text(value: &Value) -> String {
+    if let Value::String(text) = value {
+        return text.clone();
+    }
+    let mut output = String::new();
+    push_jinja_value_repr(value, &mut output);
+    output
+}
+
+fn render_tool_responses(content: Option<&Value>, output: &mut String) {
+    let Some(Value::Array(results)) = content else {
+        output.push_str("\n<response>");
+        output.push_str(&visible_text(content));
+        output.push_str("</response>");
+        return;
+    };
+
+    // The native template keeps list-valued tool results separate. In
+    // particular, Responses-style result objects expose their payload through
+    // `output`, while OpenAI text parts expose it through `text`.
+    for result in results {
+        let value = result
+            .as_object()
+            .and_then(|object| {
+                object.get("output").or_else(|| {
+                    if object.get("type").and_then(Value::as_str) == Some("text") {
+                        object.get("text")
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or(result);
+        output.push_str("\n<response>");
+        output.push_str(&template_value_text(value));
+        output.push_str("\n</response>");
+    }
+}
+
 fn json_jinja(value: &Value, output: &mut String) -> Result<()> {
     match value {
         Value::Null => output.push_str("null"),
@@ -465,11 +568,7 @@ pub fn render_prompt(
                 if index == 0 || conversation[index - 1].role != "tool" {
                     prompt.push_str("]~b]tool");
                 }
-                write!(
-                    prompt,
-                    "\n<response>{}</response>",
-                    visible_text(message.content.as_ref())
-                )?;
+                render_tool_responses(message.content.as_ref(), &mut prompt);
                 if index + 1 == conversation.len() || conversation[index + 1].role != "tool" {
                     prompt.push_str("[e~[\n");
                 }
@@ -794,11 +893,40 @@ pub fn parse_tool_calls(xml: &str, registry: &ToolRegistry) -> Vec<AssistantTool
     calls
 }
 
+fn strip_content_delimiter_prefix(mut text: &str) -> &str {
+    let mut stripped_newlines = 0;
+    loop {
+        if let Some(stripped) = text
+            .strip_prefix(THINK_END)
+            .or_else(|| text.strip_prefix(TOOL_END))
+        {
+            text = stripped;
+            continue;
+        }
+        if stripped_newlines < 2
+            && let Some(stripped) = text.strip_prefix('\n')
+        {
+            text = stripped;
+            stripped_newlines += 1;
+            continue;
+        }
+        return text;
+    }
+}
+
+fn append_content_text(output: &mut String, text: &str) {
+    if text.contains(THINK_END) || text.contains(TOOL_END) {
+        output.push_str(&text.replace(THINK_END, "").replace(TOOL_END, ""));
+    } else {
+        output.push_str(text);
+    }
+}
+
 pub fn parse_assistant(raw: &str, registry: &ToolRegistry) -> ParsedAssistant {
     // llama.cpp's current MiniMax template analysis identifies these exact
     // wrappers: `<think>\n`, `\n</think>\n\n`, and
-    // `<minimax:tool_call>\n`. Remove at most that fixed whitespace; everything
-    // else belongs to the assistant payload.
+    // `<minimax:tool_call>\n`. Remove at most that fixed whitespace and consume
+    // closing protocol markers according to the MiniMax parser state machine.
     let raw = if let Some(raw) = raw.strip_prefix(THINK_START) {
         raw.strip_prefix('\n').unwrap_or(raw)
     } else {
@@ -807,26 +935,20 @@ pub fn parse_assistant(raw: &str, registry: &ToolRegistry) -> ParsedAssistant {
     let (reasoning, remainder, reasoning_ends_at_tool) =
         if let Some((reasoning, remainder)) = raw.split_once(THINK_END) {
             let reasoning = reasoning.strip_suffix('\n').unwrap_or(reasoning);
-            let mut remainder = remainder;
-            for _ in 0..2 {
-                let Some(stripped) = remainder.strip_prefix('\n') else {
-                    break;
-                };
-                remainder = stripped;
-            }
-            (reasoning, remainder, false)
+            (reasoning, strip_content_delimiter_prefix(remainder), false)
         } else if let Some(tool_start) = raw.find(TOOL_START) {
             (&raw[..tool_start], &raw[tool_start..], true)
         } else {
             (raw, "", false)
         };
+    let reasoning = reasoning.replace(THINK_START, "");
 
     let mut content = String::new();
     let mut tool_calls = Vec::new();
     let mut cursor = 0;
     while let Some(relative_start) = remainder[cursor..].find(TOOL_START) {
         let start = cursor + relative_start;
-        content.push_str(&remainder[cursor..start]);
+        append_content_text(&mut content, &remainder[cursor..start]);
         let body_start = start + TOOL_START.len();
         let Some(relative_end) = remainder[body_start..].find(TOOL_END) else {
             content.push_str(&remainder[start..]);
@@ -848,12 +970,12 @@ pub fn parse_assistant(raw: &str, registry: &ToolRegistry) -> ParsedAssistant {
         }
         cursor = end + TOOL_END.len();
     }
-    content.push_str(&remainder[cursor..]);
+    append_content_text(&mut content, &remainder[cursor..]);
 
     let reasoning = if reasoning_ends_at_tool && !tool_calls.is_empty() {
-        reasoning.strip_suffix('\n').unwrap_or(reasoning)
+        reasoning.strip_suffix('\n').unwrap_or(&reasoning)
     } else {
-        reasoning
+        &reasoning
     };
     ParsedAssistant {
         reasoning: (!reasoning.is_empty()).then(|| reasoning.to_owned()),
@@ -1426,26 +1548,44 @@ impl ChatStreamParser {
     }
 
     pub fn push(&mut self, id: u32, text: String) -> Vec<StreamDelta> {
-        if id == self.markers.think_start {
-            self.prefix_newlines = 1;
-            return Vec::new();
+        match self.mode {
+            StreamMode::Reasoning => {
+                if id == self.markers.think_start {
+                    self.prefix_newlines = 1;
+                    return Vec::new();
+                }
+                if id == self.markers.think_end {
+                    // `\n</think>\n\n` is the fixed MiniMax reasoning delimiter.
+                    // Hold one reasoning newline until this marker arrives, then
+                    // consume at most two content-side newlines before forwarding
+                    // payload text.
+                    self.pending_newline = false;
+                    self.mode = StreamMode::Content;
+                    self.prefix_newlines = 2;
+                    return Vec::new();
+                }
+                if id == self.markers.tool_start {
+                    self.start_tool_section();
+                    return Vec::new();
+                }
+            }
+            StreamMode::Content => {
+                if id == self.markers.tool_start {
+                    self.start_tool_section();
+                    return Vec::new();
+                }
+                if id == self.markers.think_end || id == self.markers.tool_end {
+                    return Vec::new();
+                }
+            }
+            StreamMode::Tool => {
+                if id == self.markers.tool_end {
+                    return self.close_tool_section();
+                }
+            }
         }
-        if id == self.markers.think_end {
-            // `\n</think>\n\n` is the fixed MiniMax reasoning delimiter.
-            // Hold one reasoning newline until this marker arrives, then consume
-            // at most two content-side newlines before forwarding payload text.
-            self.pending_newline = false;
-            self.mode = StreamMode::Content;
-            self.prefix_newlines = 2;
-            return Vec::new();
-        }
-        if id == self.markers.tool_start {
-            self.start_tool_section();
-            return Vec::new();
-        }
-        if id == self.markers.tool_end {
-            return self.close_tool_section();
-        }
+        // A marker with no transition in the current state is assistant
+        // payload, matching the parser-engine fallback.
         self.push_text(text)
     }
 
@@ -2407,6 +2547,46 @@ mod tests {
     }
 
     #[test]
+    fn renders_structured_tool_results_as_separate_native_responses() {
+        let mut assistant = text_message("assistant", "");
+        assistant.tool_calls = vec![incoming_call("demo", json!({}))];
+        let messages = vec![
+            text_message("user", "Run it"),
+            assistant,
+            message(
+                "tool",
+                json!([
+                    {"output": "first"},
+                    {"type": "text", "text": "second"},
+                    {"output": null},
+                    {"output": true},
+                    {"output": [1, "two", null]},
+                    {"output": {"a": 1, "ok": false}}
+                ]),
+            ),
+        ];
+
+        let prompt = render_prompt(&messages, &[], false).expect("render structured results");
+        assert!(prompt.contains(concat!(
+            "]~b]tool\n",
+            "<response>first\n</response>\n",
+            "<response>second\n</response>\n",
+            "<response>None\n</response>\n",
+            "<response>True\n</response>\n",
+            "<response>[1, 'two', None]\n</response>\n",
+            "<response>{'a': 1, 'ok': False}\n</response>[e~[\n"
+        )));
+    }
+
+    #[test]
+    fn renders_nested_strings_with_python_jinja_repr() {
+        assert_eq!(
+            template_value_text(&json!({"apostrophe": "it's", "line": "a\nb"})),
+            "{'apostrophe': \"it's\", 'line': 'a\\nb'}"
+        );
+    }
+
+    #[test]
     fn rejects_empty_conversations_and_orphan_tool_results() {
         assert!(
             render_prompt(&[], &[], false)
@@ -2830,6 +3010,44 @@ mod tests {
             [StreamDelta::Reasoning(text)] if text == "<minimax:"
         ));
         assert!(parser.finish().is_empty());
+    }
+
+    #[test]
+    fn stream_parser_consumes_closing_markers_in_content_mode() {
+        let registry = registry(&[]);
+        let raw = concat!(
+            "<think>\nplan\n</think>",
+            "</think>\n",
+            "</minimax:tool_call>\n",
+            "answer",
+            "</think>",
+            "</minimax:tool_call>",
+            "tail"
+        );
+
+        let parsed = assert_stream_matches_complete(raw, &registry);
+        assert_eq!(parsed.reasoning.as_deref(), Some("plan"));
+        assert_eq!(parsed.content.as_deref(), Some("answertail"));
+    }
+
+    #[test]
+    fn stream_parser_keeps_think_markers_inside_tool_arguments() {
+        let registry = registry(&[function_tool("read")]);
+        let raw = concat!(
+            "</think>",
+            "<minimax:tool_call>",
+            "<invoke name=\"read\"><parameter name=\"path\">",
+            "<think>README.md</think>",
+            "</parameter></invoke>",
+            "</minimax:tool_call>"
+        );
+
+        let parsed = assert_stream_matches_complete(raw, &registry);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(
+            parsed_arguments(&parsed.tool_calls[0]),
+            json!({"path": "<think>README.md</think>"})
+        );
     }
 
     #[test]
