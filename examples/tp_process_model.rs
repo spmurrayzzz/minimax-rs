@@ -21,6 +21,8 @@ use std::{
 };
 
 const WORKER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(900);
+const PREFILL_VALIDATION_LENGTHS: [usize; 5] = [1, 5, 39, 512, 513];
+const PHYSICAL_PREFILL_CHUNK: usize = 512;
 const GOLDEN_TEST_TOKENS: [u32; 24] = [
     758, 3100, 3700, 494, 4500, 4969, 1204, 355, 258, 4160, 1618, 4838, 46, 517, 23413, 1352, 7623,
     36238, 46, 25209, 687, 5177, 23077, 46,
@@ -304,6 +306,12 @@ impl Drop for WorkerProcess {
     }
 }
 
+struct PrefillReference {
+    length: usize,
+    token_id: u32,
+    logits: Vec<f32>,
+}
+
 struct RunResult {
     tokens: Vec<u32>,
     logits: Vec<f32>,
@@ -313,6 +321,7 @@ struct RunResult {
     decode_wall_ms: Vec<f64>,
     load_memory: Vec<usize>,
     cache_memory: Vec<usize>,
+    prefill_references: Vec<PrefillReference>,
 }
 
 fn main() -> Result<()> {
@@ -332,6 +341,10 @@ fn run_controller(args: &Args) -> Result<()> {
     anyhow::ensure!(
         (1..=2_048).contains(&args.prefill_chunk),
         "--prefill-chunk must be between 1 and 2048"
+    );
+    anyhow::ensure!(
+        !(args.skip_pipeline && args.validate_prefill_lengths),
+        "--validate-prefill-lengths requires the pipeline reference"
     );
     let shards = discover_gguf_shards(&args.model)?;
     let tokenizer = MiniMaxTokenizer::from_gguf(&shards[0])?;
@@ -354,7 +367,10 @@ fn run_controller(args: &Args) -> Result<()> {
         print_result("pipeline", &result, &tokenizer)?;
         Some(result)
     };
-    let tensor = run_tensor_controller(args, &prompt_ids)?;
+    let prefill_references = pipeline
+        .as_ref()
+        .map_or(&[][..], |result| result.prefill_references.as_slice());
+    let tensor = run_tensor_controller(args, &prompt_ids, prefill_references)?;
     print_result("tensor", &tensor, &tokenizer)?;
 
     if let Some(pipeline) = &pipeline {
@@ -396,7 +412,7 @@ fn run_pipeline_controller(args: &Args, prompt_ids: &[u32]) -> Result<RunResult>
     let load_memory = ready.memory_used.unwrap_or_default();
     worker.request(&WorkerCommand::Reset)?;
     let (mut response, prefill_worker_ms, prefill_wall_ms) =
-        pipeline_prefill(&mut worker, prompt_ids, args.prefill_chunk, true)?;
+        pipeline_prefill(&mut worker, prompt_ids, args.prefill_chunk, true, true)?;
     let logits = response
         .logits
         .take()
@@ -422,6 +438,11 @@ fn run_pipeline_controller(args: &Args, prompt_ids: &[u32]) -> Result<RunResult>
         decode_worker_ms.push(response.milliseconds.context("pipeline decode timing")?);
         tokens.push(response.token_id.context("pipeline decode greedy token")?);
     }
+    let prefill_references = if args.validate_prefill_lengths {
+        pipeline_prefill_references(&mut worker)?
+    } else {
+        Vec::new()
+    };
     worker.shutdown()?;
     Ok(RunResult {
         tokens,
@@ -432,6 +453,7 @@ fn run_pipeline_controller(args: &Args, prompt_ids: &[u32]) -> Result<RunResult>
         decode_wall_ms,
         load_memory,
         cache_memory,
+        prefill_references,
     })
 }
 
@@ -440,6 +462,7 @@ fn pipeline_prefill(
     ids: &[u32],
     chunk_size: usize,
     return_logits: bool,
+    return_memory: bool,
 ) -> Result<(WorkerResponse, f64, f64)> {
     let started = Instant::now();
     let mut worker_ms = 0.0;
@@ -452,7 +475,7 @@ fn pipeline_prefill(
             pos,
             return_logits: return_logits && end == ids.len(),
             return_hidden: false,
-            return_memory: end == ids.len(),
+            return_memory: return_memory && end == ids.len(),
         })?;
         anyhow::ensure!(response.cache_len == Some(end));
         worker_ms += response.milliseconds.context("pipeline prefill timing")?;
@@ -466,133 +489,167 @@ fn pipeline_prefill(
     ))
 }
 
-fn run_tensor_controller(args: &Args, prompt_ids: &[u32]) -> Result<RunResult> {
+fn validation_ids(length: usize) -> Vec<u32> {
+    let mut ids = vec![42u32; length];
+    ids[0] = 1_000 + length as u32;
+    ids
+}
+
+fn pipeline_prefill_references(worker: &mut WorkerProcess) -> Result<Vec<PrefillReference>> {
+    let mut references = Vec::with_capacity(PREFILL_VALIDATION_LENGTHS.len());
+    for length in PREFILL_VALIDATION_LENGTHS {
+        worker.request(&WorkerCommand::Reset)?;
+        let ids = validation_ids(length);
+        let (mut response, _, _) =
+            pipeline_prefill(worker, &ids, PHYSICAL_PREFILL_CHUNK, true, false)?;
+        references.push(PrefillReference {
+            length,
+            token_id: response
+                .token_id
+                .context("pipeline prefill reference returned no greedy token")?,
+            logits: response
+                .logits
+                .take()
+                .context("pipeline prefill reference returned no logits")?,
+        });
+    }
+    Ok(references)
+}
+
+fn run_tensor_controller(
+    args: &Args,
+    prompt_ids: &[u32],
+    prefill_references: &[PrefillReference],
+) -> Result<RunResult> {
     let id = Id::new().context("create full-model process NCCL unique ID")?;
     let encoded_id = encode_nccl_id(&id);
     let mut ranks = [
         WorkerProcess::spawn(args, WorkerKind::Rank, Some(0), Some(&encoded_id))?,
         WorkerProcess::spawn(args, WorkerKind::Rank, Some(1), Some(&encoded_id))?,
     ];
-    let ready = receive_pair(&mut ranks)?;
-    anyhow::ensure!(ready[0].status == "ready" && ready[1].status == "ready");
-    anyhow::ensure!(ready[0].rank == Some(0) && ready[1].rank == Some(1));
-    println!(
-        "TP ranks ready NCCL={} backend={} layer_weights=[{:.2}, {:.2}]GiB global_weights=[{:.2}, {:.2}]GiB",
-        ready[0].nccl_version.unwrap_or_default(),
-        ready[0].collective_backend.as_deref().unwrap_or("unknown"),
-        gib(ready[0].layer_weight_bytes.unwrap_or_default()),
-        gib(ready[1].layer_weight_bytes.unwrap_or_default()),
-        gib(ready[0].global_weight_bytes.unwrap_or_default()),
-        gib(ready[1].global_weight_bytes.unwrap_or_default()),
-    );
-    let load_memory = vec![
-        ready[0]
-            .memory_used
-            .as_deref()
-            .and_then(|memory| memory.first())
-            .copied()
-            .unwrap_or_default(),
-        ready[1]
-            .memory_used
-            .as_deref()
-            .and_then(|memory| memory.first())
-            .copied()
-            .unwrap_or_default(),
-    ];
-
-    if args.validate_prefill_lengths {
-        validate_prefill_lengths(&mut ranks, args.prefill_chunk)?;
-    }
-    if args.check_transition {
-        validate_transition(&mut ranks, args.prefill_chunk)?;
-    }
-    pair_request(&mut ranks, &WorkerCommand::Reset)?;
-    let (mut response, prefill_worker_ms, prefill_wall_ms) =
-        tensor_prefill(&mut ranks, prompt_ids, args.prefill_chunk, true, true, true)?;
-    let logits = response[0]
-        .logits
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("rank 0 returned no prefill logits"))?;
-    anyhow::ensure!(response[1].logits.is_none());
-    compare_values(
-        "full-model TP rank hidden agreement",
-        response[0]
-            .hidden
-            .as_deref()
-            .context("rank 0 returned no final hidden state")?,
-        response[1]
-            .hidden
-            .as_deref()
-            .context("rank 1 returned no final hidden state")?,
-        Some(0.0),
-    )?;
-    let first_token = response[0]
-        .token_id
-        .context("rank 0 returned no greedy token")?;
-    anyhow::ensure!(response[1].token_id.is_none());
-    let cache_memory = vec![
-        response[0]
-            .memory_used
-            .as_deref()
-            .and_then(|memory| memory.first())
-            .copied()
-            .unwrap_or_default(),
-        response[1]
-            .memory_used
-            .as_deref()
-            .and_then(|memory| memory.first())
-            .copied()
-            .unwrap_or_default(),
-    ];
-    let mut tokens = vec![first_token];
-    let mut decode_worker_ms = Vec::new();
-    let mut decode_wall_ms = Vec::new();
-    while tokens.len() < args.max_tokens {
-        let pos = prompt_ids.len() + tokens.len() - 1;
-        let started = Instant::now();
-        response = pair_request(
-            &mut ranks,
-            &WorkerCommand::Forward {
-                ids: vec![*tokens.last().expect("generated token")],
-                pos,
-                return_logits: false,
-                return_hidden: false,
-                return_memory: false,
-            },
-        )?;
-        decode_wall_ms.push(started.elapsed().as_secs_f64() * 1e3);
-        decode_worker_ms.push(
-            response[0]
-                .milliseconds
-                .context("rank 0 decode timing")?
-                .max(response[1].milliseconds.context("rank 1 decode timing")?),
+    let result = (|| -> Result<RunResult> {
+        let ready = receive_pair(&mut ranks)?;
+        anyhow::ensure!(ready[0].status == "ready" && ready[1].status == "ready");
+        anyhow::ensure!(ready[0].rank == Some(0) && ready[1].rank == Some(1));
+        println!(
+            "TP ranks ready NCCL={} backend={} layer_weights=[{:.2}, {:.2}]GiB global_weights=[{:.2}, {:.2}]GiB",
+            ready[0].nccl_version.unwrap_or_default(),
+            ready[0].collective_backend.as_deref().unwrap_or("unknown"),
+            gib(ready[0].layer_weight_bytes.unwrap_or_default()),
+            gib(ready[1].layer_weight_bytes.unwrap_or_default()),
+            gib(ready[0].global_weight_bytes.unwrap_or_default()),
+            gib(ready[1].global_weight_bytes.unwrap_or_default()),
         );
-        let expected_cache = pos + 1;
-        anyhow::ensure!(response[0].cache_len == Some(expected_cache));
-        anyhow::ensure!(response[1].cache_len == Some(expected_cache));
-        tokens.push(response[0].token_id.context("rank 0 decode greedy token")?);
+        let load_memory = vec![
+            ready[0]
+                .memory_used
+                .as_deref()
+                .and_then(|memory| memory.first())
+                .copied()
+                .unwrap_or_default(),
+            ready[1]
+                .memory_used
+                .as_deref()
+                .and_then(|memory| memory.first())
+                .copied()
+                .unwrap_or_default(),
+        ];
+
+        if args.validate_prefill_lengths {
+            validate_prefill_lengths(&mut ranks, prefill_references)?;
+        }
+        if args.check_transition {
+            validate_transition(&mut ranks, args.prefill_chunk)?;
+        }
+        pair_request(&mut ranks, &WorkerCommand::Reset)?;
+        let (mut response, prefill_worker_ms, prefill_wall_ms) =
+            tensor_prefill(&mut ranks, prompt_ids, args.prefill_chunk, true, true, true)?;
+        let logits = response[0]
+            .logits
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("rank 0 returned no prefill logits"))?;
+        anyhow::ensure!(response[1].logits.is_none());
+        compare_values(
+            "full-model TP rank hidden agreement",
+            response[0]
+                .hidden
+                .as_deref()
+                .context("rank 0 returned no final hidden state")?,
+            response[1]
+                .hidden
+                .as_deref()
+                .context("rank 1 returned no final hidden state")?,
+            Some(0.0),
+        )?;
+        let first_token = response[0]
+            .token_id
+            .context("rank 0 returned no greedy token")?;
+        anyhow::ensure!(response[1].token_id.is_none());
+        let cache_memory = vec![
+            response[0]
+                .memory_used
+                .as_deref()
+                .and_then(|memory| memory.first())
+                .copied()
+                .unwrap_or_default(),
+            response[1]
+                .memory_used
+                .as_deref()
+                .and_then(|memory| memory.first())
+                .copied()
+                .unwrap_or_default(),
+        ];
+        let mut tokens = vec![first_token];
+        let mut decode_worker_ms = Vec::new();
+        let mut decode_wall_ms = Vec::new();
+        while tokens.len() < args.max_tokens {
+            let pos = prompt_ids.len() + tokens.len() - 1;
+            let started = Instant::now();
+            response = pair_request(
+                &mut ranks,
+                &WorkerCommand::Forward {
+                    ids: vec![*tokens.last().expect("generated token")],
+                    pos,
+                    return_logits: false,
+                    return_hidden: false,
+                    return_memory: false,
+                },
+            )?;
+            decode_wall_ms.push(started.elapsed().as_secs_f64() * 1e3);
+            decode_worker_ms.push(
+                response[0]
+                    .milliseconds
+                    .context("rank 0 decode timing")?
+                    .max(response[1].milliseconds.context("rank 1 decode timing")?),
+            );
+            let expected_cache = pos + 1;
+            anyhow::ensure!(response[0].cache_len == Some(expected_cache));
+            anyhow::ensure!(response[1].cache_len == Some(expected_cache));
+            tokens.push(response[0].token_id.context("rank 0 decode greedy token")?);
+        }
+        validate_rewind(&mut ranks, prompt_ids, &tokens)?;
+
+        Ok(RunResult {
+            tokens,
+            logits,
+            prefill_worker_ms,
+            prefill_wall_ms,
+            decode_worker_ms,
+            decode_wall_ms,
+            load_memory,
+            cache_memory,
+            prefill_references: Vec::new(),
+        })
+    })();
+    let shutdown = shutdown_rank_pair(&mut ranks);
+    match (result, shutdown) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(shutdown)) => Err(error.context(format!(
+            "coordinated rank shutdown also failed: {shutdown:#}"
+        ))),
     }
-    validate_rewind(&mut ranks, prompt_ids, &tokens)?;
-
-    pair_request(&mut ranks, &WorkerCommand::ClosePeerMapping)?;
-    pair_request(&mut ranks, &WorkerCommand::FreeLocalPeerBuffer)?;
-    let shutdown = pair_request(&mut ranks, &WorkerCommand::Shutdown)?;
-    anyhow::ensure!(shutdown[0].status == "shutdown" && shutdown[1].status == "shutdown");
-    let [mut rank0, mut rank1] = ranks;
-    let status0 = rank0.child.wait()?;
-    let status1 = rank1.child.wait()?;
-    anyhow::ensure!(status0.success() && status1.success());
-
-    Ok(RunResult {
-        tokens,
-        logits,
-        prefill_worker_ms,
-        prefill_wall_ms,
-        decode_worker_ms,
-        decode_wall_ms,
-        load_memory,
-        cache_memory,
-    })
 }
 
 fn tensor_prefill(
@@ -635,18 +692,64 @@ fn tensor_prefill(
     ))
 }
 
-fn validate_prefill_lengths(ranks: &mut [WorkerProcess; 2], chunk_size: usize) -> Result<()> {
-    for length in [1usize, 5, 39, 512, 513] {
+fn validate_prefill_lengths(
+    ranks: &mut [WorkerProcess; 2],
+    references: &[PrefillReference],
+) -> Result<()> {
+    anyhow::ensure!(
+        references
+            .iter()
+            .map(|reference| reference.length)
+            .eq(PREFILL_VALIDATION_LENGTHS),
+        "pipeline prefill references do not cover the required lengths"
+    );
+    for reference in references {
         pair_request(ranks, &WorkerCommand::Reset)?;
-        let mut ids = vec![42u32; length];
-        ids[0] = 1_000 + length as u32;
+        let ids = validation_ids(reference.length);
         let (responses, worker_ms, wall_ms) =
-            tensor_prefill(ranks, &ids, chunk_size, false, false, false)?;
-        let expected_shape = vec![1, LOCAL_KV_HEADS, length, HEAD_DIM];
+            tensor_prefill(ranks, &ids, PHYSICAL_PREFILL_CHUNK, true, true, false)?;
+        let expected_shape = vec![1, LOCAL_KV_HEADS, reference.length, HEAD_DIM];
         anyhow::ensure!(responses[0].cache_shape.as_ref() == Some(&expected_shape));
         anyhow::ensure!(responses[1].cache_shape.as_ref() == Some(&expected_shape));
-        anyhow::ensure!(responses[0].token_id.is_some());
-        println!("TP fresh prefill length={length} worker={worker_ms:.3}ms wall={wall_ms:.3}ms");
+        anyhow::ensure!(
+            responses[0].token_id == Some(reference.token_id),
+            "TP prefill length {} selected {:?}, pipeline selected {}",
+            reference.length,
+            responses[0].token_id,
+            reference.token_id
+        );
+        anyhow::ensure!(responses[1].token_id.is_none());
+        compare_values(
+            &format!(
+                "TP prefill length {} rank hidden agreement",
+                reference.length
+            ),
+            responses[0]
+                .hidden
+                .as_deref()
+                .context("rank 0 prefill returned no hidden state")?,
+            responses[1]
+                .hidden
+                .as_deref()
+                .context("rank 1 prefill returned no hidden state")?,
+            Some(0.0),
+        )?;
+        compare_values(
+            &format!(
+                "TP versus pipeline prefill length {} logits",
+                reference.length
+            ),
+            &reference.logits,
+            responses[0]
+                .logits
+                .as_deref()
+                .context("rank 0 prefill returned no logits")?,
+            None,
+        )?;
+        println!(
+            "TP fresh prefill length={} physical_chunk={} worker={worker_ms:.3}ms wall={wall_ms:.3}ms",
+            reference.length, PHYSICAL_PREFILL_CHUNK
+        );
     }
     Ok(())
 }
@@ -893,7 +996,11 @@ fn run_rank_worker(args: &Args) -> Result<()> {
             return_memory,
         } => {
             let started = Instant::now();
-            let output = model.forward(&ids, pos)?;
+            let output = if return_hidden {
+                model.forward_with_hidden(&ids, pos)?
+            } else {
+                model.forward(&ids, pos)?
+            };
             let token_id = output
                 .logits
                 .as_ref()
@@ -916,7 +1023,14 @@ fn run_rank_worker(args: &Args) -> Result<()> {
                     .transpose()?;
             }
             if return_hidden {
-                response.hidden = Some(output.hidden.flatten_all()?.to_vec1::<f32>()?);
+                response.hidden = Some(
+                    output
+                        .hidden
+                        .as_ref()
+                        .context("diagnostic forward returned no hidden state")?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?,
+                );
             }
             Ok(response)
         }
@@ -970,6 +1084,20 @@ fn write_response(response: &WorkerResponse) -> Result<()> {
     serde_json::to_writer(&mut output, response)?;
     output.write_all(b"\n")?;
     output.flush()?;
+    Ok(())
+}
+
+fn shutdown_rank_pair(ranks: &mut [WorkerProcess; 2]) -> Result<()> {
+    // CUDA requires every importer to close its IPC mapping before either
+    // exporter frees the underlying allocation. Run this even when a
+    // controller-side validation failed while both workers remain healthy.
+    pair_request(ranks, &WorkerCommand::ClosePeerMapping)?;
+    pair_request(ranks, &WorkerCommand::FreeLocalPeerBuffer)?;
+    let shutdown = pair_request(ranks, &WorkerCommand::Shutdown)?;
+    anyhow::ensure!(shutdown[0].status == "shutdown" && shutdown[1].status == "shutdown");
+    let status0 = ranks[0].child.wait()?;
+    let status1 = ranks[1].child.wait()?;
+    anyhow::ensure!(status0.success() && status1.success());
     Ok(())
 }
 

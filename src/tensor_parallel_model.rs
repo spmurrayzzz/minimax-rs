@@ -881,9 +881,10 @@ impl RankZeroGlobals {
 }
 
 /// Output from one process-owned TP rank. Rank 0 returns logits while rank 1
-/// returns only its replicated final hidden state.
+/// has no global output tensors. Diagnostic hidden states, when requested, are
+/// copied out of the reusable collective workspace before being returned.
 pub struct TensorParallelRankOutput {
-    pub hidden: Tensor,
+    pub hidden: Option<Tensor>,
     pub logits: Option<Tensor>,
 }
 
@@ -953,6 +954,26 @@ impl TensorParallelRankModel {
     }
 
     pub fn forward(&mut self, ids: &[u32], pos: usize) -> Result<TensorParallelRankOutput> {
+        self.forward_impl(ids, pos, false)
+    }
+
+    /// Runs a forward while retaining a stable copy of the final hidden state
+    /// for parity diagnostics. Normal inference should use [`Self::forward`]
+    /// to avoid this extra device allocation and copy.
+    pub fn forward_with_hidden(
+        &mut self,
+        ids: &[u32],
+        pos: usize,
+    ) -> Result<TensorParallelRankOutput> {
+        self.forward_impl(ids, pos, true)
+    }
+
+    fn forward_impl(
+        &mut self,
+        ids: &[u32],
+        pos: usize,
+        copy_hidden: bool,
+    ) -> Result<TensorParallelRankOutput> {
         self.validate_ids(ids, pos)?;
         let initial_length = self.cache_length()?;
         if initial_length != pos {
@@ -965,7 +986,7 @@ impl TensorParallelRankModel {
             .checked_add(ids.len())
             .ok_or_else(|| anyhow::anyhow!("rank {} cache length overflows usize", self.rank))?;
 
-        match self.forward_inner(ids, pos) {
+        match self.forward_inner(ids, pos, copy_hidden) {
             Ok(output) => match self.cache_length() {
                 Ok(final_length) if final_length == expected_length => Ok(output),
                 Ok(final_length) => {
@@ -987,7 +1008,12 @@ impl TensorParallelRankModel {
         }
     }
 
-    fn forward_inner(&mut self, ids: &[u32], pos: usize) -> Result<TensorParallelRankOutput> {
+    fn forward_inner(
+        &mut self,
+        ids: &[u32],
+        pos: usize,
+        copy_hidden: bool,
+    ) -> Result<TensorParallelRankOutput> {
         let query_len = ids.len();
         let input = match &self.globals {
             Some(globals) => globals
@@ -1013,6 +1039,10 @@ impl TensorParallelRankModel {
             .map(|globals| globals.logits(&hidden))
             .transpose()
             .with_context(|| format!("rank {} final norm/output projection", self.rank))?;
+        let hidden = copy_hidden
+            .then(|| hidden.copy())
+            .transpose()
+            .with_context(|| format!("rank {} copy diagnostic final hidden state", self.rank))?;
         Ok(TensorParallelRankOutput { hidden, logits })
     }
 
