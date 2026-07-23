@@ -37,7 +37,14 @@ The server defaults to `127.0.0.1:8000`. Run the API smoke test against an alrea
 ./scripts/test-completion.sh
 ```
 
-Set `BASE_URL` only when using another address. The server has no authentication or TLS; do not expose it directly to an untrusted network.
+Run the fuller API/cache/streaming matrix, with optional repeated stress, using:
+
+```bash
+./scripts/test-server.py
+./scripts/test-server.py --stress-cycles 25
+```
+
+Set `BASE_URL` for the smoke script or pass `--base-url` to the server validation script when using another address. The server has no authentication or TLS; do not expose it directly to an untrusted network.
 
 Full startup loads roughly 128 GB of weights and can take several minutes. Do not repeatedly launch inference servers during debugging without first killing the previous process.
 
@@ -80,7 +87,7 @@ curl --fail-with-body -sS -X POST http://127.0.0.1:8000/v1/completions \
   -d '{"prompt":"Hello","max_tokens":1,"temperature":0}'
 ```
 
-Test fresh 1-, 5-, 39-, and 512-token prompts plus a prompt crossing the physical chunk boundary, such as 513 tokens. Use distinct first token IDs between cases so the global prefix cache does not turn them into suffix-only evaluations. Multi-token prefill must return logits only for the final position. `scripts/test-completion.sh` does not cover every one of these lengths.
+Test fresh 1-, 5-, 39-, and 512-token prompts plus a prompt crossing the physical chunk boundary, such as 513 tokens. Use distinct first token IDs between cases so the global prefix cache does not turn them into suffix-only evaluations. Multi-token prefill must return logits only for the final position. `scripts/test-completion.sh` does not cover every one of these lengths; `scripts/test-server.py` does.
 
 When attention kernels change, run the ignored CUDA tests on the target hardware:
 

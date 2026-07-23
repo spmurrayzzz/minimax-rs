@@ -96,7 +96,7 @@ By default, Q4_K/Q5_K expert projections use direct Q8_1 MMQ for prefill batches
 
 Tensor mode keeps the HTTP controller CUDA-free. Cache reset, rewind, prefill, and decode commands are accepted only after both long-lived rank workers report the same cache length. A rank error terminates both workers so a partially advanced cache cannot be reused; `/health` then returns HTTP 503 and `/v1/models` reports `ready: false`. Rank 0 retains logits and performs both on-device greedy selection and request-local stochastic sampling, avoiding full-vocabulary JSON transfers.
 
-On the target workstation, the Phase 5 complete-token benchmark measured about 140.9 tensor-mode tokens/s versus 125.5 pipeline-mode tokens/s. Tensor mode had slower truly cold prefill in the measured 39-token case, so mode selection remains explicit and pipeline remains the default.
+Target validation confirmed the decode advantage: a warmed 5-token prompt plus 100 greedy tokens had median endpoint throughput of 140.2 tensor-mode tokens/s versus 125.7 pipeline-mode tokens/s, an 11.5% improvement. Pipeline mode remained substantially faster for warmed 512/513-token prefill (about 229/232 ms versus 381/392 ms) and completed a mixed 125-request prefill/decode matrix in 30.2 seconds versus tensor mode's 36.4 seconds. Mode selection therefore remains explicit: `pipeline` is the default for the broader workload and rollback path, while `tensor` is the decode-latency option.
 
 Each finished generation emits an info-level `inference timings` event with prompt, cache, prefill, and decode token counts; durations; latency and throughput; total inference time; and finish reason. Prefill throughput counts only the uncached prompt suffix.
 
@@ -139,7 +139,14 @@ Against a running server on the default address:
 ./scripts/test-completion.sh
 ```
 
-Set `BASE_URL` when the server uses another address.
+Run the fuller server validation matrix, optionally including repeated deterministic stress cycles:
+
+```bash
+./scripts/test-server.py
+./scripts/test-server.py --stress-cycles 25
+```
+
+The server validation script covers fresh 1/5/39/512/513-token prompts, cache reuse and rewind, stop/EOG cache exclusion, deterministic and stochastic sampling, the llama.cpp golden, and completion/reasoning/tool-call SSE reconstruction. Set `BASE_URL` for `test-completion.sh`, or pass `--base-url` to `test-server.py`, when the server uses another address.
 
 ## License
 
