@@ -228,6 +228,16 @@ impl ExecutionModel {
             _ => bail!("execution model, logits, and sampler backends do not match"),
         }
     }
+
+    fn token_logprob(&mut self, logits: &NextLogits, token_id: u32) -> Result<f32> {
+        match (self, logits) {
+            (Self::Pipeline(_), NextLogits::Pipeline(logits)) => {
+                sampling::token_logprob(logits, token_id)
+            }
+            (Self::Tensor(model), NextLogits::Tensor) => model.token_logprob(token_id),
+            _ => bail!("execution model and logits backend do not match"),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -547,6 +557,44 @@ struct GenerationResult {
     token_count: usize,
     finish: GenerationFinish,
     cached_prompt_tokens: usize,
+}
+
+struct PerplexityScore {
+    token_logprobs: Vec<f32>,
+    elapsed: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PerplexityMetrics {
+    negative_log_likelihood: f64,
+    mean_negative_log_likelihood: f64,
+    perplexity: f64,
+}
+
+fn perplexity_metrics(token_logprobs: &[f32]) -> Result<PerplexityMetrics> {
+    if token_logprobs.is_empty() {
+        bail!("perplexity requires at least one scored token")
+    }
+    let mut negative_log_likelihood = 0.0f64;
+    for (index, &logprob) in token_logprobs.iter().enumerate() {
+        if !logprob.is_finite() {
+            bail!("token log probability {index} is not finite: {logprob}")
+        }
+        if logprob > 1e-5 {
+            bail!("token log probability {index} is positive: {logprob}")
+        }
+        negative_log_likelihood -= f64::from(logprob);
+    }
+    let mean_negative_log_likelihood = negative_log_likelihood / token_logprobs.len() as f64;
+    let perplexity = mean_negative_log_likelihood.exp();
+    if !perplexity.is_finite() {
+        bail!("perplexity is not finite")
+    }
+    Ok(PerplexityMetrics {
+        negative_log_likelihood,
+        mean_negative_log_likelihood,
+        perplexity,
+    })
 }
 
 struct InferenceMetrics {
@@ -905,6 +953,60 @@ impl Engine {
         .log(request_id, finish);
         Ok(result)
     }
+
+    /// Scores each token after the first with teacher forcing. Scoring starts
+    /// from an empty cache and evaluates the final token too, leaving the
+    /// model cache in the same exact state as a normal full-prompt prefill.
+    fn score_tokens(&self, request_id: &str, tokens: &[u32]) -> Result<PerplexityScore> {
+        if tokens.len() < 2 {
+            bail!("perplexity requires at least two token ids")
+        }
+        if tokens.len() > MAX_CONTEXT {
+            bail!(
+                "perplexity prompt has {} tokens, context limit is {MAX_CONTEXT}",
+                tokens.len()
+            )
+        }
+
+        let mut state_guard = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("model lock poisoned"))?;
+        let state = state_guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("model is not loaded"))?;
+        state.model.reset()?;
+        state.cached_ids.clear();
+        state.next_logits = None;
+
+        let started = Instant::now();
+        let mut next = state.model.forward(&tokens[..1], 0)?;
+        state.cached_ids.push(tokens[0]);
+        state.next_logits = Some(next.clone());
+
+        let mut token_logprobs = Vec::with_capacity(tokens.len() - 1);
+        for &target in &tokens[1..] {
+            token_logprobs.push(state.model.token_logprob(&next, target)?);
+            let offset = state.cached_ids.len();
+            next = state.model.forward(&[target], offset)?;
+            state.cached_ids.push(target);
+            state.next_logits = Some(next.clone());
+        }
+        state.model.synchronize(&next)?;
+        let elapsed = started.elapsed();
+        info!(
+            request_id,
+            prompt_tokens = tokens.len(),
+            scored_tokens = token_logprobs.len(),
+            time_ms = rounded_metric(duration_ms(elapsed)),
+            tokens_per_second = rounded_metric(tokens_per_second(elapsed, tokens.len())),
+            "perplexity timings"
+        );
+        Ok(PerplexityScore {
+            token_logprobs,
+            elapsed,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -954,6 +1056,12 @@ enum Prompt {
     Text(String),
     Tokens(Vec<u32>),
     Batch(Vec<Prompt>),
+}
+
+#[derive(Deserialize)]
+struct PerplexityRequest {
+    model: Option<String>,
+    prompt: Prompt,
 }
 
 fn completion_prompt_tokens(
@@ -1044,6 +1152,22 @@ struct CompletionResponse {
     model: String,
     choices: Vec<Choice>,
     usage: Usage,
+}
+#[derive(Serialize)]
+struct PerplexityResponse {
+    id: String,
+    object: &'static str,
+    created: u64,
+    model: String,
+    execution_mode: String,
+    token_ids: Vec<u32>,
+    /// Entry `i` is `ln p(token_ids[i + 1] | token_ids[..=i])`.
+    token_logprobs: Vec<f32>,
+    scored_tokens: usize,
+    negative_log_likelihood: f64,
+    mean_negative_log_likelihood: f64,
+    perplexity: f64,
+    elapsed_ms: f64,
 }
 #[derive(Serialize)]
 struct Choice {
@@ -1152,6 +1276,70 @@ fn stream_response(
         .header("x-accel-buffering", "no")
         .body(Body::from_stream(ReceiverStream::new(receiver)))
         .unwrap()
+}
+
+async fn perplexity(
+    State(state): State<AppState>,
+    Json(req): Json<PerplexityRequest>,
+) -> axum::response::Response {
+    let prompt =
+        match completion_prompt_tokens(req.prompt, |text| state.engine.tokenizer.encode(text)) {
+            Ok(prompt) => prompt,
+            Err(error) => return api_error(StatusCode::BAD_REQUEST, &error.to_string()),
+        };
+    if prompt.len() < 2 {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "perplexity requires at least two tokens",
+        );
+    }
+    if prompt.len() > MAX_CONTEXT {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "perplexity prompt has {} tokens, context limit is {MAX_CONTEXT}",
+                prompt.len()
+            ),
+        );
+    }
+
+    let model_name = req.model.unwrap_or_else(|| "MiniMax-M2.7".into());
+    let execution_mode = state.engine.execution.mode.to_string();
+    let id = format!("ppl-{}", Uuid::new_v4());
+    let created = created_at();
+    let engine = state.engine.clone();
+    let request_id = id.clone();
+    let score_prompt = prompt.clone();
+    let score =
+        match tokio::task::spawn_blocking(move || engine.score_tokens(&request_id, &score_prompt))
+            .await
+        {
+            Ok(Ok(score)) => score,
+            Ok(Err(error)) => {
+                return api_error(StatusCode::SERVICE_UNAVAILABLE, &error.to_string());
+            }
+            Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        };
+    let metrics = match perplexity_metrics(&score.token_logprobs) {
+        Ok(metrics) => metrics,
+        Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let scored_tokens = score.token_logprobs.len();
+    Json(PerplexityResponse {
+        id,
+        object: "perplexity",
+        created,
+        model: model_name,
+        execution_mode,
+        token_ids: prompt,
+        token_logprobs: score.token_logprobs,
+        scored_tokens,
+        negative_log_likelihood: metrics.negative_log_likelihood,
+        mean_negative_log_likelihood: metrics.mean_negative_log_likelihood,
+        perplexity: metrics.perplexity,
+        elapsed_ms: rounded_metric(duration_ms(score.elapsed)),
+    })
+    .into_response()
 }
 
 async fn completions(
@@ -1589,6 +1777,7 @@ fn run_server(args: Args) -> Result<()> {
             .route("/v1/models", get(models))
             .route("/v1/completions", post(completions))
             .route("/v1/chat/completions", post(chat_completions))
+            .route("/v1/perplexity", post(perplexity))
             .with_state(AppState {
                 engine,
                 sampling_defaults,
@@ -1636,6 +1825,18 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn perplexity_metrics_match_known_token_probabilities() {
+        let metrics = perplexity_metrics(&[0.5f32.ln(), 0.25f32.ln()]).expect("metrics");
+        let expected_nll = -(0.5f64.ln() + 0.25f64.ln());
+        assert!((metrics.negative_log_likelihood - expected_nll).abs() < 1e-6);
+        assert!((metrics.mean_negative_log_likelihood - expected_nll / 2.0).abs() < 1e-6);
+        assert!((metrics.perplexity - 8f64.sqrt()).abs() < 1e-6);
+        assert!(perplexity_metrics(&[]).is_err());
+        assert!(perplexity_metrics(&[f32::NAN]).is_err());
+        assert!(perplexity_metrics(&[0.1]).is_err());
+    }
 
     #[test]
     fn cache_reuses_common_prefix_after_a_divergence() {

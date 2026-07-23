@@ -52,6 +52,27 @@ pub struct TokenSampler {
     rng: StdRng,
 }
 
+/// Returns `ln p(token_id)` under the unfiltered model distribution.
+///
+/// Perplexity scoring deliberately ignores temperature, top-k, and top-p: it
+/// measures the model's teacher-forced next-token distribution rather than a
+/// request's sampling policy. The reduction and scalar selection stay on the
+/// logits device, so tensor mode does not send the full vocabulary through the
+/// controller process.
+pub fn token_logprob(logits: &Tensor, token_id: u32) -> Result<f32> {
+    let vocab_size = logits.dims1()?;
+    if token_id as usize >= vocab_size {
+        bail!("token {token_id} is outside logits vocabulary size {vocab_size}")
+    }
+    let value = candle_nn::ops::log_softmax(logits, D::Minus1)?
+        .get(token_id as usize)?
+        .to_scalar::<f32>()?;
+    if !value.is_finite() {
+        bail!("token {token_id} has non-finite log probability {value}")
+    }
+    Ok(value)
+}
+
 impl TokenSampler {
     pub fn new(params: SamplingParams, seed: u64) -> Result<Self> {
         Ok(Self {
@@ -184,6 +205,14 @@ mod tests {
         };
         let mut sampler = TokenSampler::new(params, 7).expect("sampler");
         assert_eq!(sampler.sample(&logits(&[0.0, 3.0, 2.0])).unwrap(), 1);
+    }
+
+    #[test]
+    fn token_logprob_scores_the_unfiltered_distribution() {
+        let values = logits(&[0.0, 3f32.ln()]);
+        assert!((token_logprob(&values, 0).unwrap() - 0.25f32.ln()).abs() < 1e-6);
+        assert!((token_logprob(&values, 1).unwrap() - 0.75f32.ln()).abs() < 1e-6);
+        assert!(token_logprob(&values, 2).is_err());
     }
 
     #[test]

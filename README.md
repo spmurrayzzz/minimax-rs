@@ -63,6 +63,7 @@ Endpoints:
 - `GET /v1/models`
 - `POST /v1/completions`
 - `POST /v1/chat/completions`
+- `POST /v1/perplexity` (deterministic validation extension)
 
 Minimal chat request:
 
@@ -85,6 +86,8 @@ Supported behavior includes:
 - `stop` as one string or up to four strings, plus GGUF and MiniMax end-of-generation tokens.
 - `max_tokens` on both endpoints and `max_completion_tokens` on chat requests.
 - Longest-common-token-prefix KV reuse, reported as `usage.prompt_tokens_details.cached_tokens`.
+
+`POST /v1/perplexity` accepts the same single string or token-ID-array `prompt` shape as text completions. It resets the shared cache, scores every token after the first with teacher forcing, and returns the token IDs plus `ln p(token[i] | token[:i])` values. The first token is context rather than a scored target. This endpoint is intentionally non-OpenAI and intended for parity validation; scoring is token-by-token and displaces the server's reusable generation cache.
 
 This is an OpenAI-compatible subset, not a complete implementation. Requests are serialized through one model mutex and share one global KV cache, so an unrelated request can displace a reusable prefix. The total context limit is 196,608 tokens. The default output limit is 131,072 tokens and is clipped to the context remaining after the prompt.
 
@@ -146,7 +149,23 @@ Run the fuller server validation matrix, optionally including repeated determini
 ./scripts/test-server.py --stress-cycles 25
 ```
 
-The server validation script covers fresh 1/5/39/512/513-token prompts, cache reuse and rewind, stop/EOG cache exclusion, deterministic and stochastic sampling, the llama.cpp golden, and completion/reasoning/tool-call SSE reconstruction. Set `BASE_URL` for `test-completion.sh`, or pass `--base-url` to `test-server.py`, when the server uses another address.
+The server validation script covers fresh 1/5/39/512/513-token prompts, cache reuse and rewind, stop/EOG cache exclusion, deterministic and stochastic sampling, teacher-forced perplexity scoring, the llama.cpp golden, and completion/reasoning/tool-call SSE reconstruction. Set `BASE_URL` for `test-completion.sh`, or pass `--base-url` to `test-server.py`, when the server uses another address.
+
+Capture a paired teacher-forced perplexity comparison without loading both execution modes at once. First start pipeline mode and save its artifact:
+
+```bash
+./scripts/validate-ppl.py corpus.txt --output pipeline-ppl.json
+```
+
+Restart the server in tensor mode, then score exactly the same corpus against that reference:
+
+```bash
+./scripts/validate-ppl.py corpus.txt \
+  --reference pipeline-ppl.json \
+  --output tensor-ppl.json
+```
+
+The comparison reports aggregate PPL delta, paired mean/p50/p95/p99/max token-NLL differences, and the worst token positions. It reports without imposing an arbitrary acceptance policy by default. Add any combination of `--max-relative-ppl-delta`, `--max-mean-abs-token-nll-delta`, and `--max-p99-abs-token-nll-delta` to turn selected metrics into exit-code gates. Use `--token-ids` when the corpus file is a JSON token-ID array; this removes tokenizer behavior from the model-math comparison.
 
 ## License
 

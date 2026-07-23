@@ -58,6 +58,7 @@ enum WorkerCommand {
     Truncate { seq_len: usize },
     BeginSampling { params: SamplingParams, seed: u64 },
     Sample,
+    TokenLogprob { token_id: u32 },
     ClosePeerMapping,
     FreeLocalPeerBuffer,
     Shutdown,
@@ -75,6 +76,7 @@ struct WorkerResponse {
     cache_shape: Option<Vec<usize>>,
     has_logits: Option<bool>,
     token_id: Option<u32>,
+    token_logprob: Option<f32>,
     self_test_values: Option<Vec<f32>>,
     message: Option<String>,
 }
@@ -98,6 +100,7 @@ impl WorkerResponse {
             cache_shape: None,
             has_logits: Some(false),
             token_id: None,
+            token_logprob: None,
             self_test_values: None,
             message: None,
         }
@@ -115,6 +118,7 @@ impl WorkerResponse {
             cache_shape,
             has_logits: Some(has_logits),
             token_id: None,
+            token_logprob: None,
             self_test_values: None,
             message: None,
         }
@@ -132,6 +136,7 @@ impl WorkerResponse {
             cache_shape: None,
             has_logits: None,
             token_id: None,
+            token_logprob: None,
             self_test_values: None,
             message: Some(format!("{error:#}")),
         }
@@ -451,6 +456,27 @@ impl TensorParallelController {
         Ok(token)
     }
 
+    /// Scores one target while keeping the complete vocabulary in rank 0.
+    pub fn token_logprob(&mut self, token_id: u32) -> Result<f32> {
+        if !self.has_logits {
+            bail!("tensor rank 0 has no logits available for scoring")
+        }
+        if token_id >= VOCAB_SIZE as u32 {
+            bail!("score token {token_id} is outside vocabulary size {VOCAB_SIZE}")
+        }
+        let response = self.rank0_request(&WorkerCommand::TokenLogprob { token_id })?;
+        self.accept_rank0_response(&response, true)?;
+        let value = response
+            .token_logprob
+            .context("tensor rank 0 returned no token log probability")?;
+        if !value.is_finite() {
+            return self.invalidate(anyhow::anyhow!(
+                "tensor rank 0 returned non-finite token log probability {value}"
+            ));
+        }
+        Ok(value)
+    }
+
     fn accept_cache_responses(
         &mut self,
         responses: &[WorkerResponse; WORLD_SIZE],
@@ -704,6 +730,18 @@ fn run_model_worker(model_dir: &Path, rank: usize, id: Id) -> Result<()> {
             response.token_id = Some(token_id);
             Ok(response)
         }
+        WorkerCommand::TokenLogprob { token_id } => {
+            if rank != 0 {
+                bail!("token scoring is rank-0-only")
+            }
+            let value = crate::sampling::token_logprob(
+                latest_logits.as_ref().context("rank 0 has no logits")?,
+                token_id,
+            )?;
+            let mut response = WorkerResponse::done(model.cache_length()?, None, true);
+            response.token_logprob = Some(value);
+            Ok(response)
+        }
         WorkerCommand::ClosePeerMapping => {
             model.close_peer_mapping()?;
             Ok(WorkerResponse::done(
@@ -768,7 +806,10 @@ fn run_dry_worker(rank: usize, id: Id) -> Result<()> {
         | WorkerCommand::Forward { .. }
         | WorkerCommand::Truncate { .. }
         | WorkerCommand::BeginSampling { .. }
-        | WorkerCommand::Sample => bail!("dry-run tensor worker received model command"),
+        | WorkerCommand::Sample
+        | WorkerCommand::TokenLogprob { .. } => {
+            bail!("dry-run tensor worker received model command")
+        }
         WorkerCommand::Shutdown => unreachable!("shutdown is handled by worker_loop"),
     })
 }

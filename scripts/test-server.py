@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import time
 import urllib.request
 
@@ -207,6 +208,26 @@ def validate_sampling_and_golden(client: Client) -> None:
     print("deterministic, stochastic, and llama.cpp golden sampling: ok")
 
 
+def validate_perplexity(client: Client) -> None:
+    prompt = [6100, 777, 778, 779]
+    response = client.post("/v1/perplexity", {"prompt": prompt})
+    assert response["object"] == "perplexity", response
+    assert response["execution_mode"] in {"pipeline", "tensor"}, response
+    assert response["token_ids"] == prompt, response
+    logprobs = response["token_logprobs"]
+    assert len(logprobs) == len(prompt) - 1, response
+    assert all(math.isfinite(value) and value <= 1e-5 for value in logprobs), response
+    nll = math.fsum(-value for value in logprobs)
+    mean_nll = nll / len(logprobs)
+    assert math.isclose(response["negative_log_likelihood"], nll, rel_tol=1e-6), response
+    assert math.isclose(
+        response["mean_negative_log_likelihood"], mean_nll, rel_tol=1e-6
+    ), response
+    assert math.isclose(response["perplexity"], math.exp(mean_nll), rel_tol=1e-6), response
+    assert response["scored_tokens"] == len(logprobs), response
+    print("teacher-forced perplexity scoring: ok")
+
+
 def validate_streaming(client: Client) -> None:
     completion_payload = {
         "prompt": [5100, 777, 778, 779, 780],
@@ -371,6 +392,7 @@ def main() -> None:
     validate_cache_rewind(client)
     validate_stop_and_eog(client)
     validate_sampling_and_golden(client)
+    validate_perplexity(client)
     validate_streaming(client)
     stress(client, args.stress_cycles)
     print(
