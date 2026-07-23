@@ -2,7 +2,7 @@
 
 ## Project
 
-`minimax` is a Rust/Candle CUDA inference server for MiniMax-M2.7 split GGUF weights. The execution graph is fixed to four shards and exactly two NVIDIA RTX PRO 6000 Blackwell Workstation Edition GPUs (`sm_120`), with layers split 31/31.
+`minimax` is a Rust/Candle CUDA inference server for MiniMax-M2.7 split GGUF weights. The execution graph is fixed to four shards and exactly two NVIDIA RTX PRO 6000 Blackwell Workstation Edition GPUs (`sm_120`). Pipeline mode uses the established 31/31 layer split; optional TP=2 mode uses one process-owned rank with all 62 local layer shards per GPU.
 
 ## Commands
 
@@ -22,11 +22,14 @@ Build for the target machine:
 CUDA_COMPUTE_CAP=120f cargo build --release
 ```
 
-Parse shard metadata, construct the tokenizer, and initialize both CUDA devices without loading model tensors or starting HTTP:
+Parse shard metadata, construct the tokenizer, and initialize the selected two-GPU topology without loading model weights or starting HTTP:
 
 ```bash
 CUDA_COMPUTE_CAP=120f cargo run --release -- --dry-run
+CUDA_COMPUTE_CAP=120f cargo run --release -- --parallelism tensor --dry-run
 ```
+
+The tensor dry run starts both rank processes, initializes NCCL/CUDA IPC, and exercises both small peer and NCCL all-reduces.
 
 The server defaults to `127.0.0.1:8000`. Run the API smoke test against an already-running server with:
 
@@ -45,7 +48,10 @@ Full startup loads roughly 128 GB of weights and can take several minutes. Do no
 - Model dimensions are hardcoded for MiniMax-M2.7: GQA, Q/K RMSNorm, 64-dimension partial RoPE, 62 layers, KV caching, and sigmoid-gated top-8-of-256 MoE routing.
 - Model layers are selectively loaded from all shards onto both GPUs; GGUF shard boundaries can split an individual layer.
 - RoPE positions and frequencies must be constructed in F32. F16 positions lose integer precision after 2,048 and overflow before the 196,608-token context limit.
-- Activations at the layer 30/31 boundary and final activations returning from GPU 1 to GPU 0 are staged through host memory. Direct Candle peer copies exposed stale allocations on this machine, with the first divergent tensor at layer 31.
+- In pipeline mode, activations at the layer 30/31 boundary and final activations returning from GPU 1 to GPU 0 are staged through host memory. Direct Candle peer copies exposed stale allocations on this machine, with the first divergent tensor at layer 31.
+- In tensor mode, the HTTP controller owns no CUDA state. It must spawn exactly one long-lived worker per GPU before Tokio starts; each worker creates and retains its own device, allocator state, model shards, KV caches, and collective rank. Preserve Linux parent-death signaling, worker process-group/signal isolation, and coordinated IPC teardown so workers are not orphaned or terminated ahead of the controller during startup or shutdown.
+- Tensor cache-mutating commands are always paired. Accept cache state only after both ranks report the same expected length; terminate both workers after a rank failure so partially advanced state is never reused, and publish that fatal invalidation through HTTP readiness.
+- Tensor rank 0 retains logits and performs sampling in-process. Preserve the on-device greedy path and do not serialize full-vocabulary logits through the controller for normal generation.
 - `vendor/candle-transformers` contains the MiniMax sigmoid router and expert-bias selection behavior.
 - `vendor/candle-kernels` contains a PTX 9.3-to-9.2 compatibility workaround for the installed CUDA 13.3 toolkit and 595-series driver exposing CUDA 13.2 compatibility.
 - `vendor/cudarc` binds the owning CUDA context before freeing untracked async allocations. This is required because inference disables allocation-event tracking and requests can move between worker threads while using two contexts.
@@ -60,7 +66,8 @@ Full startup loads roughly 128 GB of weights and can take several minutes. Do no
 - Stream content, reasoning, and tool-call deltas incrementally; never buffer the complete response before emitting SSE. UTF-8 completion, stop-prefix matching, and protocol parsing may temporarily withhold partial text.
 - MiniMax tool use requires the native `# Tools`/`<tools>` system section and `<minimax:tool_call><invoke ...>` parsing. Preserve canonical tool rendering (`name`, `description`, and `parameters`), JSON Schema validation, `tool_choice` policies, incremental OpenAI tool-call deltas, prior assistant calls, grouped tool results, and assistant whitespace.
 - A leading `developer` message is treated like the system message. Preserve the existing handling of later policy roles and the tested reasoning retention/omission semantics.
-- Sampling precedence is built-in defaults, then server flags, then per-request fields. `temperature=0` must retain the deterministic on-device argmax path.
+- Sampling precedence is built-in defaults, then server flags, then per-request fields. `temperature=0` must retain the deterministic on-device argmax path in both execution modes.
+- `--parallelism pipeline|tensor` and `MINIMAX_PARALLELISM` select execution without changing API schemas. Keep `pipeline` as the default rollback path unless validation explicitly changes that decision.
 - Model state retains one exact token-prefix KV cache across requests. Rewind every layer to the longest common prefix when a prompt diverges and reset only when no prefix is reusable. A direct sequential agent follow-up with a shared prefix and no intervening request should report nonzero `usage.prompt_tokens_details.cached_tokens`.
 
 ## Validation expectations

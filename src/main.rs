@@ -8,20 +8,43 @@ use axum::{
     routing::{get, post},
 };
 use candle_core::{Device, Tensor, quantized::gguf_file};
-use clap::Parser;
-use minimax::{chat, model, sampling, tokenizer};
+use clap::{Parser, ValueEnum};
+use minimax::{
+    chat, model, sampling,
+    tensor_parallel_model::{HEAD_DIM, KV_HEADS, QUERY_HEADS},
+    tensor_parallel_server::{self, TensorParallelController, TensorParallelInfo},
+    tokenizer,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     convert::Infallible,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{net::TcpListener, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info};
 use uuid::Uuid;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Parallelism {
+    Pipeline,
+    Tensor,
+}
+
+impl std::fmt::Display for Parallelism {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Pipeline => "pipeline",
+            Self::Tensor => "tensor",
+        })
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "minimax-server", about = "MiniMax-M2.7 GGUF inference server")]
@@ -31,6 +54,14 @@ struct Args {
     model: PathBuf,
     #[arg(long, default_value = "127.0.0.1:8000")]
     host: String,
+    /// Two-GPU execution strategy.
+    #[arg(
+        long,
+        env = "MINIMAX_PARALLELISM",
+        value_enum,
+        default_value_t = Parallelism::Pipeline
+    )]
+    parallelism: Parallelism,
     /// Default sampling temperature. Zero selects greedy decoding.
     #[arg(
         long = "temp",
@@ -44,9 +75,15 @@ struct Args {
     /// Default number of highest-logit candidates to retain. Zero disables top-k.
     #[arg(long, default_value_t = sampling::DEFAULT_TOP_K)]
     top_k: usize,
-    /// Parse every GGUF shard and validate the model without starting HTTP.
+    /// Parse every GGUF shard and validate the selected GPU topology without starting HTTP.
     #[arg(long)]
     dry_run: bool,
+    #[arg(long = "internal-tp-rank", hide = true)]
+    internal_tp_rank: Option<usize>,
+    #[arg(long = "internal-tp-nccl-id", hide = true)]
+    internal_tp_nccl_id: Option<String>,
+    #[arg(long = "internal-tp-dry-run", hide = true)]
+    internal_tp_dry_run: bool,
 }
 
 impl Args {
@@ -105,12 +142,143 @@ fn prefill_chunk() -> usize {
     })
 }
 
+#[derive(Clone)]
+enum NextLogits {
+    Pipeline(Tensor),
+    /// Rank 0 retains the logits in its worker process.
+    Tensor,
+}
+
+enum GenerationSampler {
+    Pipeline(Box<sampling::TokenSampler>),
+    /// Sampling executes in rank 0 so stochastic decoding does not serialize
+    /// the complete vocabulary through the worker command pipe.
+    Tensor,
+}
+
+enum ExecutionModel {
+    Pipeline(model::Model),
+    Tensor(Box<TensorParallelController>),
+}
+
+impl ExecutionModel {
+    fn reset(&mut self) -> Result<()> {
+        match self {
+            Self::Pipeline(model) => {
+                model.reset();
+                Ok(())
+            }
+            Self::Tensor(model) => model.reset(),
+        }
+    }
+
+    fn truncate_cache(&mut self, seq_len: usize) -> Result<()> {
+        match self {
+            Self::Pipeline(model) => model.truncate_cache(seq_len),
+            Self::Tensor(model) => model.truncate_cache(seq_len),
+        }
+    }
+
+    fn forward(&mut self, ids: &[u32], pos: usize) -> Result<NextLogits> {
+        match self {
+            Self::Pipeline(model) => Ok(NextLogits::Pipeline(model.forward(ids, pos)?)),
+            Self::Tensor(model) => {
+                model.forward(ids, pos)?;
+                Ok(NextLogits::Tensor)
+            }
+        }
+    }
+
+    fn synchronize(&self, logits: &NextLogits) -> Result<()> {
+        match (self, logits) {
+            (Self::Pipeline(_), NextLogits::Pipeline(logits)) => {
+                logits.device().synchronize()?;
+                Ok(())
+            }
+            // Tensor rank workers synchronize before acknowledging Forward.
+            (Self::Tensor(_), NextLogits::Tensor) => Ok(()),
+            _ => bail!("execution model and logits backend do not match"),
+        }
+    }
+
+    fn begin_sampling(
+        &mut self,
+        params: sampling::SamplingParams,
+        seed: u64,
+    ) -> Result<GenerationSampler> {
+        match self {
+            Self::Pipeline(_) => Ok(GenerationSampler::Pipeline(Box::new(
+                sampling::TokenSampler::new(params, seed)?,
+            ))),
+            Self::Tensor(model) => {
+                model.begin_sampling(params, seed)?;
+                Ok(GenerationSampler::Tensor)
+            }
+        }
+    }
+
+    fn sample(&mut self, logits: &NextLogits, sampler: &mut GenerationSampler) -> Result<u32> {
+        match (self, logits, sampler) {
+            (
+                Self::Pipeline(_),
+                NextLogits::Pipeline(logits),
+                GenerationSampler::Pipeline(sampler),
+            ) => sampler.sample(logits),
+            (Self::Tensor(model), NextLogits::Tensor, GenerationSampler::Tensor) => model.sample(),
+            _ => bail!("execution model, logits, and sampler backends do not match"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ExecutionInfo {
+    mode: Parallelism,
+    tp_size: usize,
+    query_heads_per_rank: usize,
+    kv_heads_per_rank: usize,
+    head_dim: usize,
+    communicator_backend: String,
+    nccl_version: Option<i32>,
+    layer_weight_bytes: [usize; 2],
+    global_weight_bytes: [usize; 2],
+}
+
+impl ExecutionInfo {
+    fn pipeline() -> Self {
+        Self {
+            mode: Parallelism::Pipeline,
+            tp_size: 1,
+            query_heads_per_rank: QUERY_HEADS,
+            kv_heads_per_rank: KV_HEADS,
+            head_dim: HEAD_DIM,
+            communicator_backend: "none (host-staged pipeline boundary)".to_owned(),
+            nccl_version: None,
+            layer_weight_bytes: [0; 2],
+            global_weight_bytes: [0; 2],
+        }
+    }
+
+    fn tensor(info: &TensorParallelInfo) -> Self {
+        Self {
+            mode: Parallelism::Tensor,
+            tp_size: info.world_size,
+            query_heads_per_rank: info.local_query_heads,
+            kv_heads_per_rank: info.local_kv_heads,
+            head_dim: info.head_dim,
+            communicator_backend: info.collective_backend.clone(),
+            nccl_version: Some(info.nccl_version),
+            layer_weight_bytes: info.layer_weight_bytes,
+            global_weight_bytes: info.global_weight_bytes,
+        }
+    }
+}
+
 struct ModelState {
-    model: model::Model,
+    model: ExecutionModel,
     /// Token IDs represented by every layer's KV cache. Follow-up prompts can
     /// reuse any exact prefix of these IDs after rewinding the cache.
     cached_ids: Vec<u32>,
-    next_logits: Option<Tensor>,
+    next_logits: Option<NextLogits>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -452,13 +620,14 @@ fn tokens_per_second(duration: Duration, tokens: usize) -> f64 {
 
 /// Owns the loaded execution graph and tokenizer behind the API boundary.
 struct Engine {
-    ready: bool,
+    ready: Arc<AtomicBool>,
     state: std::sync::Mutex<Option<ModelState>>,
     tokenizer: tokenizer::MiniMaxTokenizer,
+    execution: ExecutionInfo,
 }
 
 impl Engine {
-    fn open(model_dir: &Path, load_model: bool) -> Result<Self> {
+    fn open(model_dir: &Path, parallelism: Parallelism, load_model: bool) -> Result<Self> {
         let shards = minimax::model_files::discover_gguf_shards(model_dir)?;
 
         let mut tensors = 0usize;
@@ -473,30 +642,68 @@ impl Engine {
             bail!("model appears incomplete: only {tensors} tensors found");
         }
 
-        let devices = (0..2)
-            .map(Device::new_cuda)
-            .collect::<candle_core::Result<Vec<_>>>()?;
-        // Inference uses exactly one CUDA stream per GPU and synchronizes the
-        // host-staged device boundary explicitly. Avoid cudarc's per-allocation
-        // cross-stream events, which otherwise dominate single-token decode.
-        for device in &devices {
-            unsafe { device.as_cuda_device()?.disable_event_tracking() };
-        }
         let tokenizer = tokenizer::MiniMaxTokenizer::from_gguf(&shards[0])?;
-        let loaded = if load_model {
-            Some(ModelState {
-                model: model::Model::load(&shards, &devices)?,
-                cached_ids: Vec::new(),
-                next_logits: None,
-            })
-        } else {
-            None
+        let (loaded, execution, ready) = match parallelism {
+            Parallelism::Pipeline => {
+                let devices = (0..2)
+                    .map(Device::new_cuda)
+                    .collect::<candle_core::Result<Vec<_>>>()?;
+                // Pipeline inference uses exactly one CUDA stream per GPU and
+                // synchronizes the host-staged device boundary explicitly.
+                // Avoid per-allocation cross-stream events, which otherwise
+                // dominate single-token decode.
+                for device in &devices {
+                    unsafe { device.as_cuda_device()?.disable_event_tracking() };
+                }
+                let loaded = if load_model {
+                    Some(ModelState {
+                        model: ExecutionModel::Pipeline(model::Model::load(&shards, &devices)?),
+                        cached_ids: Vec::new(),
+                        next_logits: None,
+                    })
+                } else {
+                    None
+                };
+                (
+                    loaded,
+                    ExecutionInfo::pipeline(),
+                    Arc::new(AtomicBool::new(load_model)),
+                )
+            }
+            Parallelism::Tensor => {
+                if load_model {
+                    let controller = TensorParallelController::load(model_dir)?;
+                    let execution = ExecutionInfo::tensor(controller.info());
+                    let ready = controller.readiness_handle();
+                    (
+                        Some(ModelState {
+                            model: ExecutionModel::Tensor(Box::new(controller)),
+                            cached_ids: Vec::new(),
+                            next_logits: None,
+                        }),
+                        execution,
+                        ready,
+                    )
+                } else {
+                    let info = TensorParallelController::dry_run(model_dir)?;
+                    (
+                        None,
+                        ExecutionInfo::tensor(&info),
+                        Arc::new(AtomicBool::new(false)),
+                    )
+                }
+            }
         };
         Ok(Self {
-            ready: load_model,
+            ready,
             state: std::sync::Mutex::new(loaded),
             tokenizer,
+            execution,
         })
+    }
+
+    fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
     }
 
     fn marker_ids(&self) -> chat::MarkerIds {
@@ -534,7 +741,8 @@ impl Engine {
             )
         }
         let max_tokens = max_tokens.min(MAX_CONTEXT - prompt.len());
-        let mut sampler = sampling::TokenSampler::new(sampling_params, rand::random())?;
+        let sampling_params = sampling_params.validate()?;
+        let sampling_seed = rand::random();
         let mut state_guard = self
             .state
             .lock()
@@ -547,7 +755,7 @@ impl Engine {
         let reuse = cache_reuse(prompt, &state.cached_ids, state.next_logits.is_some());
         let cached_prompt_tokens = reuse.cached_tokens;
         if cached_prompt_tokens == 0 {
-            state.model.reset();
+            state.model.reset()?;
             state.cached_ids.clear();
             state.next_logits = None;
         } else if cached_prompt_tokens < previous_cache_tokens {
@@ -589,7 +797,7 @@ impl Engine {
         }
         let mut next = next.context("no logits available for prompt")?;
         if prefill_tokens > 0 {
-            next.device().synchronize()?;
+            state.model.synchronize(&next)?;
         }
         let prefill_time = if prefill_tokens > 0 {
             prefill_started.elapsed()
@@ -597,6 +805,7 @@ impl Engine {
             Duration::ZERO
         };
         state.next_logits = Some(next.clone());
+        let mut sampler = state.model.begin_sampling(sampling_params, sampling_seed)?;
 
         let decode_started = Instant::now();
         let mut generated = Vec::new();
@@ -606,8 +815,9 @@ impl Engine {
         let mut logits_pending = false;
         for _ in 0..max_tokens {
             // Greedy sampling reduces the 200k vocabulary on-device. Positive
-            // temperatures use the request-local stochastic sampler.
-            let id = sampler.sample(&next)?;
+            // temperatures use a request-local stochastic sampler; tensor
+            // mode keeps that sampler in rank 0 beside the logits.
+            let id = state.model.sample(&next, &mut sampler)?;
             logits_pending = false;
             if self.tokenizer.is_eog(id) {
                 // The EOG token was selected but not evaluated, so neither the
@@ -674,7 +884,7 @@ impl Engine {
         // so wait for them before calculating throughput and releasing the
         // cache to the next request.
         if logits_pending {
-            next.device().synchronize()?;
+            state.model.synchronize(&next)?;
         }
         let decode_time = decode_started.elapsed();
 
@@ -865,12 +1075,23 @@ struct ApiError {
     code: Option<&'static str>,
 }
 
-async fn health() -> impl IntoResponse {
-    Json(serde_json::json!({"status":"ok"}))
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let ready = state.engine.is_ready();
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "status": if ready { "ok" } else { "unavailable" }
+        })),
+    )
 }
 async fn models(State(state): State<AppState>) -> impl IntoResponse {
     Json(
-        serde_json::json!({"object":"list","data":[{"id":"MiniMax-M2.7","object":"model","owned_by":"MiniMax","ready":state.engine.ready}]}),
+        serde_json::json!({"object":"list","data":[{"id":"MiniMax-M2.7","object":"model","owned_by":"MiniMax","ready":state.engine.is_ready()}]}),
     )
 }
 
@@ -1309,38 +1530,106 @@ fn api_error(status: StatusCode, message: &str) -> axum::response::Response {
         .into_response()
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
     let args = Args::parse();
+    if let Some(rank) = args.internal_tp_rank {
+        let nccl_id = args
+            .internal_tp_nccl_id
+            .as_deref()
+            .context("tensor rank worker requires --internal-tp-nccl-id")?;
+        return tensor_parallel_server::run_worker(
+            &args.model,
+            rank,
+            nccl_id,
+            args.internal_tp_dry_run,
+        );
+    }
+    if args.internal_tp_nccl_id.is_some() || args.internal_tp_dry_run {
+        bail!("internal tensor worker flags require --internal-tp-rank")
+    }
+    run_server(args)
+}
+
+fn run_server(args: Args) -> Result<()> {
     let sampling_defaults = args
         .sampling_defaults()
         .context("invalid server sampling settings")?;
-    let engine = Arc::new(Engine::open(&args.model, !args.dry_run)?);
+    // Model/controller initialization happens before Tokio starts. In tensor
+    // mode this also guarantees that the controller owns no CUDA state and
+    // each spawned rank creates its device in its own process.
+    let engine = Arc::new(Engine::open(&args.model, args.parallelism, !args.dry_run)?);
+    info!(
+        execution_mode = %engine.execution.mode,
+        tp_size = engine.execution.tp_size,
+        query_heads_per_rank = engine.execution.query_heads_per_rank,
+        kv_heads_per_rank = engine.execution.kv_heads_per_rank,
+        head_dim = engine.execution.head_dim,
+        communicator_backend = %engine.execution.communicator_backend,
+        nccl_version = ?engine.execution.nccl_version,
+        layer_weight_bytes = ?engine.execution.layer_weight_bytes,
+        global_weight_bytes = ?engine.execution.global_weight_bytes,
+        "initialized execution mode"
+    );
     if args.dry_run {
-        println!("validated 4 GGUF shards for MiniMax-M2.7 on 2 CUDA devices");
+        println!(
+            "validated 4 GGUF shards for MiniMax-M2.7 in {} mode on 2 CUDA devices ({})",
+            engine.execution.mode, engine.execution.communicator_backend
+        );
         return Ok(());
     }
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/v1/models", get(models))
-        .route("/v1/completions", post(completions))
-        .route("/v1/chat/completions", post(chat_completions))
-        .with_state(AppState {
-            engine,
-            sampling_defaults,
-        });
-    let listener = TcpListener::bind(&args.host).await?;
-    info!(
-        address = %args.host,
-        prefill_chunk = prefill_chunk(),
-        temperature = sampling_defaults.temperature,
-        top_p = sampling_defaults.top_p,
-        top_k = sampling_defaults.top_k,
-        "MiniMax server listening"
-    );
-    axum::serve(listener, app).await?;
-    Ok(())
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("create Tokio runtime")?;
+    runtime.block_on(async move {
+        let app = Router::new()
+            .route("/health", get(health))
+            .route("/v1/models", get(models))
+            .route("/v1/completions", post(completions))
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(AppState {
+                engine,
+                sampling_defaults,
+            });
+        let listener = TcpListener::bind(&args.host).await?;
+        info!(
+            address = %args.host,
+            execution_mode = %args.parallelism,
+            prefill_chunk = prefill_chunk(),
+            temperature = sampling_defaults.temperature,
+            top_p = sampling_defaults.top_p,
+            top_k = sampling_defaults.top_k,
+            "MiniMax server listening"
+        );
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+        Ok(())
+    })
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(error) = result {
+                    tracing::error!(%error, "failed to receive Ctrl-C");
+                }
+            }
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        tracing::error!(%error, "failed to receive Ctrl-C");
+    }
+    info!("shutting down MiniMax server");
 }
 
 #[cfg(test)]
@@ -1421,6 +1710,17 @@ mod tests {
             defaults.sampling_defaults().unwrap(),
             sampling::SamplingParams::default()
         );
+        assert_eq!(defaults.parallelism, Parallelism::Pipeline);
+
+        let tensor = Args::try_parse_from([
+            "minimax-server",
+            "--model",
+            "/tmp/model",
+            "--parallelism",
+            "tensor",
+        ])
+        .expect("tensor parallelism argument");
+        assert_eq!(tensor.parallelism, Parallelism::Tensor);
 
         let overridden = Args::try_parse_from([
             "minimax-server",
@@ -1569,13 +1869,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_and_model_readiness_follow_the_shared_flag() {
+        let (tokenizer, _, _) = tokenizer::token_type_fixture().expect("test tokenizer");
+        let ready = Arc::new(AtomicBool::new(false));
+        let state = AppState {
+            engine: Arc::new(Engine {
+                ready: ready.clone(),
+                state: std::sync::Mutex::new(None),
+                tokenizer,
+                execution: ExecutionInfo::pipeline(),
+            }),
+            sampling_defaults: sampling::SamplingParams::default(),
+        };
+
+        let unavailable = health(State(state.clone())).await.into_response();
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        ready.store(true, Ordering::Release);
+        let healthy = health(State(state.clone())).await.into_response();
+        assert_eq!(healthy.status(), StatusCode::OK);
+
+        let response = models(State(state)).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("models response body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("models response JSON");
+        assert_eq!(body["data"][0]["ready"], true);
+    }
+
+    #[tokio::test]
     async fn completion_batch_endpoint_returns_http_400_before_streaming() {
         let (tokenizer, _, _) = tokenizer::token_type_fixture().expect("test tokenizer");
         let state = AppState {
             engine: Arc::new(Engine {
-                ready: false,
+                ready: Arc::new(AtomicBool::new(false)),
                 state: std::sync::Mutex::new(None),
                 tokenizer,
+                execution: ExecutionInfo::pipeline(),
             }),
             sampling_defaults: sampling::SamplingParams::default(),
         };

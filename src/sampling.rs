@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use candle_core::{D, Tensor};
 use rand::{Rng, SeedableRng, rngs::StdRng};
+use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_TEMPERATURE: f64 = 1.0;
 pub const DEFAULT_TOP_P: f64 = 0.95;
@@ -8,7 +9,7 @@ pub const DEFAULT_TOP_K: usize = 40;
 
 /// Sampling settings after applying the built-in, server, and request-level
 /// precedence rules.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SamplingParams {
     pub temperature: f64,
     pub top_p: f64,

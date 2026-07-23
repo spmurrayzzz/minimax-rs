@@ -4,7 +4,10 @@ A bespoke Rust/Candle CUDA inference server for MiniMax-M2.7 split GGUF weights.
 
 ## Scope and requirements
 
-The current execution graph is specific to MiniMax-M2.7: model dimensions, 62 layers, four GGUF shards, and a two-GPU 31/31 layer split are fixed in code.
+The execution graph is specific to MiniMax-M2.7: model dimensions, 62 layers, four GGUF shards, and exactly two GPUs are fixed in code. Two execution modes are available:
+
+- `pipeline` (default) keeps the established 31/31 layer split.
+- `tensor` starts one process per GPU; each process owns all 62 rank-local weight shards and head-sharded KV caches. Hidden states are reduced across TP=2 after each attention and MoE block.
 
 Tested setup:
 
@@ -13,7 +16,7 @@ Tested setup:
 - A recent Rust toolchain with Rust 2024 edition support
 - A directory containing exactly four regular `.gguf` shard files and no unrelated GGUF files
 
-The server does not download or distribute model weights. It runs on one machine, requires exactly two CUDA devices, and does not support distributed inference. Loading the current quantization uses roughly 128 GB for weights and can take several minutes.
+The server does not download or distribute model weights. It runs on one machine, requires exactly two CUDA devices, and does not support multi-machine inference. Loading the current quantization uses roughly 128 GB for weights and can take several minutes.
 
 ## Run
 
@@ -30,10 +33,22 @@ The server and weight-backed examples also accept `--model DIR`, which takes pre
 CUDA_COMPUTE_CAP=120f cargo run --release -- --model /path/to/model
 ```
 
-To inspect shard metadata, construct the tokenizer, and verify that two CUDA devices can be initialized without loading model tensors or starting HTTP:
+Select tensor parallelism explicitly with `--parallelism tensor` or `MINIMAX_PARALLELISM=tensor`:
 
 ```bash
+CUDA_COMPUTE_CAP=120f cargo run --release -- --parallelism tensor
+```
+
+`pipeline` remains the default rollback path. Request and response schemas are identical in both modes.
+
+To inspect shard metadata, construct the tokenizer, and validate the selected GPU topology without loading model weights or starting HTTP:
+
+```bash
+# Initialize both pipeline CUDA devices.
 CUDA_COMPUTE_CAP=120f cargo run --release -- --dry-run
+
+# Spawn both TP ranks, initialize NCCL/CUDA IPC, and run collective self-tests.
+CUDA_COMPUTE_CAP=120f cargo run --release -- --parallelism tensor --dry-run
 ```
 
 Use `--host 0.0.0.0:8000` only when remote access is intentional. The server has no built-in authentication or TLS and should otherwise remain on localhost or behind a trusted authenticated proxy.
@@ -79,6 +94,10 @@ Prompt prefill defaults to 512-token physical chunks with CUDA FlashAttention ov
 
 By default, Q4_K/Q5_K expert projections use direct Q8_1 MMQ for prefill batches of at least 32 tokens. Shorter batches use the lower-overhead generic parallel kernel, while other supported GGUF expert types retain the repaired F16 WMMA path for batches of at least 192 tokens.
 
+Tensor mode keeps the HTTP controller CUDA-free. Cache reset, rewind, prefill, and decode commands are accepted only after both long-lived rank workers report the same cache length. A rank error terminates both workers so a partially advanced cache cannot be reused; `/health` then returns HTTP 503 and `/v1/models` reports `ready: false`. Rank 0 retains logits and performs both on-device greedy selection and request-local stochastic sampling, avoiding full-vocabulary JSON transfers.
+
+On the target workstation, the Phase 5 complete-token benchmark measured about 140.9 tensor-mode tokens/s versus 125.5 pipeline-mode tokens/s. Tensor mode had slower truly cold prefill in the measured 39-token case, so mode selection remains explicit and pipeline remains the default.
+
 Each finished generation emits an info-level `inference timings` event with prompt, cache, prefill, and decode token counts; durations; latency and throughput; total inference time; and finish reason. Prefill throughput counts only the uncached prompt suffix.
 
 ## Test
@@ -86,10 +105,18 @@ Each finished generation emits an info-level `inference timings` event with prom
 Run the default suite:
 
 ```bash
+cargo fmt
+cargo check
 cargo test
 ```
 
-It does not load model weights or initialize CUDA devices, although compiling the test binaries still requires the configured CUDA toolchain. It covers API and chat protocol behavior, tokenizer splitting and token types, sampling, stop matching, cache reuse, shard discovery, and attention workspace sizing.
+The default suite does not load model weights or initialize CUDA devices, although compiling the test binaries still requires the configured CUDA toolchain. It covers API and chat protocol behavior, tokenizer splitting and token types, sampling, stop matching, cache reuse, shard discovery, and attention workspace sizing.
+
+Validate tensor-mode process and collective startup without loading weights:
+
+```bash
+CUDA_COMPUTE_CAP=120f cargo run --release -- --parallelism tensor --dry-run
+```
 
 Run the tokenizer integration test with external weights:
 
@@ -98,9 +125,11 @@ MINIMAX_MODEL_DIR=/path/to/model \
   cargo test gguf_tokenizer_round_trip -- --ignored
 ```
 
-Run the ignored CUDA attention correctness and near-context-limit tests on the target hardware:
+Run the ignored tensor-parallel and CUDA attention tests on the target hardware (the TP layer test also requires weights):
 
 ```bash
+cargo test --test tp_collective -- --ignored --nocapture
+cargo test --test tp_layer -- --ignored --nocapture
 cargo test --test gqa_prefill -- --ignored --nocapture
 ```
 
